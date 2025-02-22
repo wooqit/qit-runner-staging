@@ -1,0 +1,187 @@
+name: Daily Cache Setup
+
+# All workflows expect to do a cache hit on the Docker Images. For that, this workflow runs on a daily cron to cache the Docker Images and make sure everything is ready for the workflows.
+
+on:
+  # Every day at 0am UTC
+  schedule:
+    - cron: '0 0 * * *'
+  # Manually
+  workflow_dispatch:
+  # By another workflow
+  workflow_call:
+
+# 1. Deletes all daily caches.
+# 2. Pulls docker images from remote and creates docker caches for individual images.
+# 3. Pulls docker images from remote and creates docker bundle caches.
+jobs:
+  delete_daily_cache:
+    runs-on: ubuntu-latest
+    permissions:
+      # `actions:write` permission is required to delete caches
+      actions: write
+      contents: read
+    steps:
+      # DAILY_CACHE_BURST_START
+      - name: Daily Cache Burst.
+        run: echo "daily-cache-burst=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+        
+      - name: Yesterday Cache Burst.
+        run: echo "yesterday-cache-burst=$(date -u -d 'yesterday' +'%Y-%m-%d')" >> $GITHUB_ENV
+      # DAILY_CACHE_BURST_END
+
+      - name: Day Before Yesterday Cache Burst.
+        run: echo "day-before-yesterday-cache-burst=$(date -u -d '2 days ago' +'%Y-%m-%d')" >> $GITHUB_ENV
+
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Delete Caches from today
+        run: |
+          gh extension install actions/gh-actions-cache
+          
+          REPO=${{ github.repository }}
+          pattern="${{ env.daily-cache-burst }}"
+          
+          while :; do
+          echo "Fetching list of cache keys from today"
+          cacheKeys=$(gh actions-cache list -R $REPO --key $pattern --limit 100 | cut -f 1)
+          
+          if [ -z "$cacheKeys" ]; then
+          echo "No more cache keys found. Exiting."
+          break
+          fi
+          
+          ## Setting this to not fail the workflow while deleting cache keys.
+          set +e
+          echo "Deleting caches..."
+          for cacheKey in $cacheKeys
+          do
+          gh actions-cache delete $cacheKey -R $REPO --confirm
+          done
+          echo "Caches deleted in current batch."
+          done
+          echo "Cache cleanup complete."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete Caches from 2 days ago
+        run: |
+          gh extension install actions/gh-actions-cache
+          
+          REPO=${{ github.repository }}
+          pattern="${{ env.day-before-yesterday-cache-burst }}"
+          
+          while :; do
+          echo "Fetching list of cache keys from 2 days ago"
+          cacheKeys=$(gh actions-cache list -R $REPO --key $pattern --limit 100 | cut -f 1)
+          
+          if [ -z "$cacheKeys" ]; then
+          echo "No more cache keys found. Exiting."
+          break
+          fi
+          
+          ## Setting this to not fail the workflow while deleting cache keys.
+          set +e
+          echo "Deleting caches..."
+          for cacheKey in $cacheKeys
+          do
+          gh actions-cache delete $cacheKey -R $REPO --confirm
+          done
+          echo "Caches deleted in current batch."
+          done
+          echo "Cache cleanup complete."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  cache_individual_docker_images:
+    if: false # Skip individual images for now due to 429.
+    needs: delete_daily_cache
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        docker_images: [
+          {"image": "mysql", "docker_image": "jbergstroem/mariadb-alpine:10.6.12"},
+          {"image": "nginx", "docker_image": "nginx:stable-alpine3.17-slim"},
+          {"image": "redis", "docker_image": "redis:6.2.11-alpine"},
+          {"image": "playwright", "docker_image": "automattic/qit-runner-playwright:1.49.1"},
+          {"image": "zip", "docker_image": "automattic/qit-runner-zip:latest"},
+          {"image": "busybox", "docker_image": "busybox:latest"},
+          {"image": "php-7.2", "docker_image": "automattic/qit-runner-php-7.2-fpm-alpine:latest"},
+          {"image": "php-7.3", "docker_image": "automattic/qit-runner-php-7.3-fpm-alpine:latest"},
+          {"image": "php-7.4", "docker_image": "automattic/qit-runner-php-7.4-fpm-alpine:latest"},
+          {"image": "php-8.0", "docker_image": "automattic/qit-runner-php-8.0-fpm-alpine:latest"},
+          {"image": "php-8.1", "docker_image": "automattic/qit-runner-php-8.1-fpm-alpine:latest"},
+          {"image": "php-8.2", "docker_image": "automattic/qit-runner-php-8.2-fpm-alpine:latest"},
+          {"image": "php-8.3", "docker_image": "automattic/qit-runner-php-8.3-fpm-alpine:latest"},
+          {"image": "php-8.4", "docker_image": "automattic/qit-runner-php-8.4-fpm-alpine:latest"},
+        ]
+    steps:
+      - name: Image Cache - Step 1
+        uses: actions/cache@v4
+        with:
+          path: ci/cache/docker/${{ matrix.docker_images.image }}
+          key: ${{ env.daily-cache-burst }}-cache-docker-${{ matrix.docker_images.image }}
+
+      - name: Install pigz
+        run: sudo apt-get install -y pigz
+
+      - name: Update Image Cache
+        run: rm -rf ci/cache/docker/${{ matrix.docker_images.image }} && docker pull ${{ matrix.docker_images.docker_image }} && mkdir -p ci/cache/docker/${{ matrix.docker_images.image }} && docker image save ${{ matrix.docker_images.docker_image }} | pigz > ./ci/cache/docker/${{ matrix.docker_images.image }}/image.tar
+  cache_docker_bundles:
+    needs: delete_daily_cache
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        php_version: [
+          # "7.2", # Uncached. Low-traffic.
+          # "7.3", # Uncached. Low-traffic.
+          "7.4",
+          # "8.0", # Uncached. Low-traffic.
+          # "8.1", # Uncached. Low-traffic.
+          "8.2",
+          "8.3",
+          "8.4",
+        ]
+    steps:
+      # DAILY_CACHE_BURST_START
+      - name: Daily Cache Burst.
+        run: echo "daily-cache-burst=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+        
+      - name: Yesterday Cache Burst.
+        run: echo "yesterday-cache-burst=$(date -u -d 'yesterday' +'%Y-%m-%d')" >> $GITHUB_ENV
+      # DAILY_CACHE_BURST_END
+
+      - name: Cache Bundle for PHP version
+        uses: actions/cache@v4
+        with:
+          path: ci/cache/docker/bundle/php-${{ matrix.php_version }}
+          key: ${{ env.daily-cache-burst }}-cache-docker-bundle-php-${{ matrix.php_version }}
+
+      - name: Install pigz
+        run: sudo apt-get install -y pigz
+
+      - name: Create Bundle
+        run: |
+          docker_images=(
+            "mysql:jbergstroem/mariadb-alpine:10.6.12"
+            "nginx:nginx:stable-alpine3.17-slim"
+            "redis:redis:6.2.11-alpine"
+            "playwright:automattic/qit-runner-playwright:1.49.1"
+            "zip:automattic/qit-runner-zip:latest"
+            "busybox:busybox:latest"
+            "php-${{ matrix.php_version }}:automattic/qit-runner-php-${{ matrix.php_version }}-fpm-alpine:latest"
+          )
+
+          for image in "${docker_images[@]}"; do
+            IFS=":" read -ra image_parts <<< "$image"
+            image_name=${image_parts[0]}
+            image_tag="${image_parts[1]}:${image_parts[2]}"
+          
+            echo "Pulling $image_name with tag $image_tag"
+            docker pull $image_tag
+
+            echo "Saving $image_name to bundle"
+            mkdir -p ci/cache/docker/bundle/php-${{ matrix.php_version }}/$image_name
+            docker image save $image_tag | pigz > ci/cache/docker/bundle/php-${{ matrix.php_version }}/$image_name/image.tar
+          done

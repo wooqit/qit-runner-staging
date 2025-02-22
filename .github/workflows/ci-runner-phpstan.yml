@@ -1,0 +1,281 @@
+name: CI Runner PHPStan
+on:
+  repository_dispatch:
+    types: [cd-test-phpstan]
+jobs:
+  ci-runner-phpstan:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        test_run: ${{ github.event.client_payload.test_runs }}
+    env:
+      # JOB_ENV_START
+      PHP_EXTENSIONS: ${{ toJSON( matrix.test_run.environment.php_extensions ) }}
+      QIT_ENABLE_HPOS: ${{ toJSON( matrix.test_run.environment.optional_features.hpos ) }}
+      QIT_ENABLE_NEW_PRODUCT_EDITOR: ${{ toJSON( matrix.test_run.environment.optional_features.new_product_editor ) }}
+      PHP_VERSION: ${{ github.event.client_payload.shared_matrix_data.php_version }}
+      WOOCOMMERCE_VERSION: ${{ matrix.test_run.environment.woocommerce_version }}
+      WORDPRESS_VERSION: ${{ matrix.test_run.environment.wordpress_version }}
+      SUT_SLUG: ${{ matrix.test_run.sut_slug }}
+      SUT_WOO_ID: ${{ matrix.test_run.sut_woo_id }}
+      TEST_TYPE: ${{ matrix.test_run.test_type }}
+      SUT_VERSION: Undefined
+      JOB_NAME: ${{ matrix.test_run.sut_name }}
+      # JOB_ENV_END
+    # JOB_EXTRA_START
+    name: ${{ matrix.test_run.sut_name }}
+      # JOB_EXTRA_END
+    steps:
+      # HEADER_START
+      - name: Daily Cache Burst.
+        run: echo "daily-cache-burst=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+        
+      - name: Yesterday Cache Burst.
+        run: echo "yesterday-cache-burst=$(date -u -d 'yesterday' +'%Y-%m-%d')" >> $GITHUB_ENV
+
+      - name: Set dynamic environment variables.
+        run: |
+          echo "TEST_TYPE_CACHE_DIR=$GITHUB_WORKSPACE/ci/cache/test-type/${{ matrix.test_run.test_type }}" >> $GITHUB_ENV
+          echo "WP_CLI_CACHE_DIR=$GITHUB_WORKSPACE/ci/cache/test-type/${{ matrix.test_run.test_type }}/wp-cli" >> $GITHUB_ENV
+          echo "PLAYWRIGHT_BROWSERS_PATH=$GITHUB_WORKSPACE/ci/cache/test-type/${{ matrix.test_run.test_type }}/playwright-browsers" >> $GITHUB_ENV
+        
+      - name: Plugin Under Test - ${{ matrix.test_run.sut_name }}
+        run: echo "Starting test for plugin \"${{ matrix.test_run.sut_name }}\""
+        
+      - name: Generate a unique id
+        id: gen-id
+        if: always()
+        run: |
+          echo "rand=$(openssl rand -hex 3)" >> "$GITHUB_OUTPUT"
+          
+      - name: Remove special characters from JOB_NAME
+        if: always()
+        run: |
+          echo "CLEAN_JOB_NAME=$(echo $JOB_NAME | tr -cd '[:alnum:]')" >> $GITHUB_ENV
+        
+      - name: Checkout code.
+        uses: actions/checkout@v4
+      # HEADER_END
+
+      # CLI_SETUP
+      - name: CI CLI Cache
+        id: cache-ci-cli
+        uses: actions/cache@v4
+        with:
+          path: ci/cli/vendor
+          key: ${{ hashFiles( 'ci/cli/composer.lock' ) }}
+
+      - name: CI CLI Setup
+        if: steps.cache-ci-cli.outputs.cache-hit != 'true'
+        working-directory: ci/cli
+        run: composer install --no-interaction --no-progress --no-suggest --prefer-dist --optimize-autoloader --no-dev
+      # CLI_SETUP_END
+
+      # UPDATE_TEST_STATUS_START
+      - name: Notify Manager That Test Has Started
+        id: test-in-progress
+        working-directory: ci/cli
+        env:
+          TEST_RUN_ID: ${{ matrix.test_run.test_run_id }}
+          CI_SECRET: ${{ secrets.CI_SECRET }}
+          CI_STAGING_SECRET: ${{ secrets.CI_STAGING_SECRET }}
+          MANAGER_HOST: ${{ github.event.client_payload.shared_matrix_data.manager_host }}
+          RESULTS_ENDPOINT: ${{ github.event.client_payload.shared_matrix_data.in_progress_endpoint }}
+          TEST_RUN_HASH: ${{ matrix.test_run.custom_payload.hash }}
+          WORKFLOW_ID: ${{ github.run_id }}
+          CANCELLED: ${{ steps.workflow-cancelled.outputs.cancelled }}
+        run: php src/cli.php notify -s
+      # UPDATE_TEST_STATUS_END
+
+      # TEST_TYPE_CACHE_START
+      - name: Restore Test Type Cache (WP CLI Cache (WP zips, plugins zips, etc), Playwright cache if needed, etc)
+        id: cache-qit-daily-test-type
+        uses: actions/cache@v4
+        with:
+          fail-on-cache-miss: false
+          path: ci/cache/test-type
+          key: ${{ env.daily-cache-burst }}-test-type-${{ matrix.test_run.test_type }}-${{ matrix.test_run.environment.woocommerce_version }}-${{ matrix.test_run.environment.wordpress_version }}
+          restore-keys: | # Allow to restore from last day cache if current day doesn't exist.
+            ${{ env.yesterday-cache-burst }}-test-type-${{ matrix.test_run.test_type }}-${{ matrix.test_run.environment.woocommerce_version }}-${{ matrix.test_run.environment.wordpress_version }}
+      # TEST_TYPE_CACHE_END
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          tools: none
+          # PS: This PHP version is unrelated to which PHP version will run the test. This is only to run the scripts in GitHub.
+          php-version: '8.3'
+          ini-values: "memory_limit=1G"
+
+      - name: Create Temporary WordPress directory
+        run: mkdir -p ci/tmp/wordpress
+
+      - name: Create Cache dir
+        run: mkdir -p $WP_CLI_CACHE_DIR
+
+      - name: Download WordPress Core
+        working-directory: ci/tmp/wordpress
+        run: php $GITHUB_WORKSPACE/ci/tests/phpstan/wp-cli.phar core download --version=${{ matrix.test_run.environment.wordpress_version }}
+
+      - name: Debug cache
+        run: cd $WP_CLI_CACHE_DIR && pwd && ls -la
+
+      - name: Download WooCommerce
+        run: |
+          if [ ! -f "$TEST_TYPE_CACHE_DIR/woocommerce/woocommerce-${{ matrix.test_run.environment.woocommerce_version }}.zip" ]; then
+            echo "Cache miss. Downloading..."
+            curl -L --create-dirs -o "$TEST_TYPE_CACHE_DIR/woocommerce/woocommerce-${{ matrix.test_run.environment.woocommerce_version }}.zip" https://github.com/woocommerce/woocommerce/releases/download/${{ matrix.test_run.environment.woocommerce_version }}/woocommerce.zip
+            echo "Done."
+          else
+            echo "woocommerce-${{ matrix.test_run.environment.woocommerce_version }}.zip already exists in cache. Skipping download."
+          fi
+          unzip -q "$TEST_TYPE_CACHE_DIR/woocommerce/woocommerce-${{ matrix.test_run.environment.woocommerce_version }}.zip" -d "$GITHUB_WORKSPACE/ci/tmp/wordpress/wp-content/plugins/"
+
+      - name: Debug Cache
+        run: ls -la $TEST_TYPE_CACHE_DIR/woocommerce
+
+      - name: Debug WordPress
+        run: ls -la ci/tmp/wordpress
+
+      - name: Debug WordPress Plugins
+        run: ls -la ci/tmp/wordpress/wp-content/plugins
+
+      - name: Debug WordPress Themes
+        run: ls -la ci/tmp/wordpress/wp-content/themes
+
+      # DOWNLOAD_PLUGINS_START
+      - name: Create Plugin Directories
+        working-directory: ci
+        run: mkdir -p plugins & mkdir -p themes
+      
+      - name: Download Plugin Activation Stack
+        working-directory: ci/cli
+        env:
+          TOKEN: ${{ secrets.TOKEN }}
+          ACCEPT_HEADER: ${{ secrets.ACCEPT_HEADER }}
+          WOO_DOWNLOAD_URL: ${{ secrets.WOO_DOWNLOAD_URL }}
+          SHA_URL: ${{ secrets.SHA_URL }}
+          CI_ENCRYPTION_KEY: ${{ secrets.CI_ENCRYPTION_KEY }}
+          SHA_POSTFIELDS: ${{ secrets.SHA_POSTFIELDS }}
+          PLUGINS_ZIPS: ${{ toJSON( github.event.client_payload.shared_matrix_data.plugin_zips ) }}
+          PLUGINS_JSON: ${{ toJSON( matrix.test_run.plugins ) }}
+          THEME_DIRECTORY: ${{ github.workspace }}/ci/themes
+          PLUGIN_DIRECTORY: ${{ github.workspace }}/ci/plugins
+          SKIP_CACHE: true
+        run: php src/cli.php download-plugins
+      # DOWNLOAD_PLUGINS_END
+
+      # FIND_ENTRY_POINT_START
+      - name: Identify Plugin or Theme Entry Point
+        working-directory: ci/bin
+        id: find_entry
+        env:
+          PARENT_DIRECTORY: ${{ github.workspace }}/ci/${{ matrix.test_run.sut_type }}s
+          PLUGIN_TYPE: ${{ matrix.test_run.sut_type }}
+          PLUGIN_SLUG: ${{ matrix.test_run.sut_slug }}
+          GITHUB_OUTPUT: $GITHUB_OUTPUT
+        run: php find-plugin-entrypoint.php ${{ env.PARENT_DIRECTORY }} ${{ env.PLUGIN_SLUG }} ${{ env.PLUGIN_TYPE }}
+
+      - name: Display Extracted Information
+        run: |
+          echo "Plugin/Theme Directory: ${{ steps.find_entry.outputs.plugin_directory }}"
+          echo "Entry Point File: ${{ steps.find_entry.outputs.entry_point }}"
+      # FIND_ENTRY_POINT_END
+
+      # SUT_VERSION_START
+      - name: Get SUT version (Debug)
+        if: always()
+        run: ls -la $GITHUB_WORKSPACE/ci/${{ matrix.test_run.sut_type }}s && ls -la $GITHUB_WORKSPACE/ci/${{ matrix.test_run.sut_type }}s/${{ steps.find_entry.outputs.plugin_directory }}
+        
+      - name: Get SUT version (Debug)
+        if: always()
+        id: sut-version
+        working-directory: ci/cli
+        env:
+          PLUGIN_DIRECTORY: ${{ github.workspace }}/ci/${{ matrix.test_run.sut_type }}s/${{ steps.find_entry.outputs.plugin_directory }}
+          PLUGIN_TYPE: ${{ matrix.test_run.sut_type }}
+          PLUGIN_SLUG: ${{ steps.find_entry.outputs.entry_point }}
+        run: php src/cli.php header -o Version
+      # SUT_VERSION_END
+
+      - name: Debug Plugin List
+        working-directory: ci
+        run: pwd && ls -la ./plugins
+
+      - name: Debug Theme List
+        working-directory: ci
+        run: pwd && ls -la ./themes
+
+      - uses: actions/cache@v4
+        id: cache-runner-phpstan
+        with:
+          path: ci/tests/phpstan/vendor
+          key: ${{ runner.os }}-${{ hashFiles('ci/tests/phpstan/composer.lock') }}
+
+      - name: Composer install
+        if: steps.cache-runner-phpstan.outputs.cache-hit != 'true'
+        working-directory: ci/tests/phpstan
+        run: composer install --prefer-dist
+
+      - name: Clone Stubz
+        working-directory: ci/tests/phpstan
+        run: |
+          git clone https://github.com/Luc45/stubz.git
+          cd stubz
+          composer install
+
+      - name: Generate stubs (SUT + any other extensions)
+        working-directory: ci/tests/phpstan
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          SUT_SLUG: ${{ matrix.test_run.sut_slug }}
+          SUT_TYPE: ${{ matrix.test_run.sut_type }}
+          EXTENSIONS_JSON: ${{ toJSON( matrix.test_run.plugins ) }}
+        run: php generate-stubs.php
+
+      - name: Upload Generated Stubs as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: phpstan-stubs-${{ matrix.test_run.sut_slug }}
+          path: ci/tests/phpstan/stubs/
+          retention-days: 7  # Keep artifacts for 7 days
+
+      - name: Generate PHPStan Config File
+        working-directory: ci
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          SUT_TYPE: ${{ matrix.test_run.sut_type }}
+          PLUGINS_JSON: ${{ toJSON( matrix.test_run.plugins ) }}
+          PHPSTAN_LEVEL: ${{ matrix.test_run.custom_payload.phpstan_level }}
+        run: php ./tests/phpstan/generate-phpstan.php ${{ steps.find_entry.outputs.plugin_directory }}
+
+      - name: Debug PHPStan File
+        run: cat ci/tests/phpstan/phpstan.neon
+
+      - name: Run PHPStan
+        id: run-phpstan
+        timeout-minutes: 15
+        working-directory: ci
+        run: php ./tests/phpstan/vendor/bin/phpstan.phar --configuration=./tests/phpstan/phpstan.neon --memory-limit=2G --error-format=json > tests/phpstan/phpstan.json
+
+      - name: Workflow Cancelled
+        id: workflow-cancelled
+        if: cancelled()
+        run: echo "cancelled=1" >> "$GITHUB_OUTPUT"
+
+      - name: Send test result
+        if: always()
+        working-directory: ci/cli
+        run: php src/cli.php notify -r
+        env:
+          TEST_RUN_ID: ${{ matrix.test_run.test_run_id }}
+          CI_SECRET: ${{ secrets.CI_SECRET }}
+          CI_STAGING_SECRET: ${{ secrets.CI_STAGING_SECRET }}
+          MANAGER_HOST: ${{ github.event.client_payload.shared_matrix_data.manager_host }}
+          RESULTS_ENDPOINT: ${{ github.event.client_payload.shared_matrix_data.results_endpoint }}
+          TEST_RESULT: ${{ steps.run-phpstan.outcome }}
+          TEST_RESULT_JSON: tests/phpstan/phpstan.json
+          WORKSPACE: ${{ github.workspace }}/ci
+          SUT_VERSION: ${{ steps.sut-version.outputs.header }}
+          CANCELLED: ${{ steps.workflow-cancelled.outputs.cancelled }}

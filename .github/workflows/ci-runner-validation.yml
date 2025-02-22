@@ -1,0 +1,258 @@
+name: CI Runner Validation
+on:
+  repository_dispatch:
+    types: [cd-test-validation]
+jobs:
+  ci-runner-validation:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        test_run: ${{ github.event.client_payload.test_runs }}
+    env:
+      # JOB_ENV_START
+      PHP_EXTENSIONS: ${{ toJSON( matrix.test_run.environment.php_extensions ) }}
+      QIT_ENABLE_HPOS: ${{ toJSON( matrix.test_run.environment.optional_features.hpos ) }}
+      QIT_ENABLE_NEW_PRODUCT_EDITOR: ${{ toJSON( matrix.test_run.environment.optional_features.new_product_editor ) }}
+      PHP_VERSION: ${{ github.event.client_payload.shared_matrix_data.php_version }}
+      WOOCOMMERCE_VERSION: ${{ matrix.test_run.environment.woocommerce_version }}
+      WORDPRESS_VERSION: ${{ matrix.test_run.environment.wordpress_version }}
+      SUT_SLUG: ${{ matrix.test_run.sut_slug }}
+      SUT_WOO_ID: ${{ matrix.test_run.sut_woo_id }}
+      TEST_TYPE: ${{ matrix.test_run.test_type }}
+      SUT_VERSION: Undefined
+      JOB_NAME: ${{ matrix.test_run.sut_name }} - WP ${{ matrix.test_run.environment.wordpress_version }} - WC ${{ matrix.test_run.environment.woocommerce_version }} - PHP ${{ github.event.client_payload.shared_matrix_data.php_version }}
+      # JOB_ENV_END
+    # JOB_EXTRA_START
+    name: ${{ matrix.test_run.sut_name }} - WP ${{ matrix.test_run.environment.wordpress_version }} - WC ${{ matrix.test_run.environment.woocommerce_version }} - PHP ${{ github.event.client_payload.shared_matrix_data.php_version }}
+      # JOB_EXTRA_END
+    steps:
+      # HEADER_START
+      - name: Daily Cache Burst.
+        run: echo "daily-cache-burst=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+        
+      - name: Yesterday Cache Burst.
+        run: echo "yesterday-cache-burst=$(date -u -d 'yesterday' +'%Y-%m-%d')" >> $GITHUB_ENV
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ github.event.client_payload.shared_matrix_data.php_version }}
+          ini-values: "memory_limit=1G"
+
+      - name: Set dynamic environment variables.
+        run: |
+          echo "TEST_TYPE_CACHE_DIR=$GITHUB_WORKSPACE/ci/cache/test-type/${{ matrix.test_run.test_type }}" >> $GITHUB_ENV
+          echo "WP_CLI_CACHE_DIR=$GITHUB_WORKSPACE/ci/cache/test-type/${{ matrix.test_run.test_type }}/wp-cli" >> $GITHUB_ENV
+          echo "PLAYWRIGHT_BROWSERS_PATH=$GITHUB_WORKSPACE/ci/cache/test-type/${{ matrix.test_run.test_type }}/playwright-browsers" >> $GITHUB_ENV
+        
+      - name: Plugin Under Test - ${{ matrix.test_run.sut_name }}
+        run: echo "Starting test for plugin \"${{ matrix.test_run.sut_name }}\""
+        
+      - name: Generate a unique id
+        id: gen-id
+        if: always()
+        run: |
+          echo "rand=$(openssl rand -hex 3)" >> "$GITHUB_OUTPUT"
+          
+      - name: Remove special characters from JOB_NAME
+        if: always()
+        run: |
+          echo "CLEAN_JOB_NAME=$(echo $JOB_NAME | tr -cd '[:alnum:]')" >> $GITHUB_ENV
+        
+      - name: Checkout code.
+        uses: actions/checkout@v4
+      # HEADER_END
+
+      # CLI_SETUP
+      - name: CI CLI Cache
+        id: cache-ci-cli
+        uses: actions/cache@v4
+        with:
+          path: ci/cli/vendor
+          key: ${{ hashFiles( 'ci/cli/composer.lock' ) }}
+
+      - name: CI CLI Setup
+        if: steps.cache-ci-cli.outputs.cache-hit != 'true'
+        working-directory: ci/cli
+        run: composer install --no-interaction --no-progress --no-suggest --prefer-dist --optimize-autoloader --no-dev
+      # CLI_SETUP_END
+
+      # UPDATE_TEST_STATUS_START
+      - name: Notify Manager That Test Has Started
+        id: test-in-progress
+        working-directory: ci/cli
+        env:
+          TEST_RUN_ID: ${{ matrix.test_run.test_run_id }}
+          CI_SECRET: ${{ secrets.CI_SECRET }}
+          CI_STAGING_SECRET: ${{ secrets.CI_STAGING_SECRET }}
+          MANAGER_HOST: ${{ github.event.client_payload.shared_matrix_data.manager_host }}
+          RESULTS_ENDPOINT: ${{ github.event.client_payload.shared_matrix_data.in_progress_endpoint }}
+          TEST_RUN_HASH: ${{ matrix.test_run.custom_payload.hash }}
+          WORKFLOW_ID: ${{ github.run_id }}
+          CANCELLED: ${{ steps.workflow-cancelled.outputs.cancelled }}
+        run: php src/cli.php notify -s
+      # UPDATE_TEST_STATUS_END
+
+      # DOWNLOAD_PLUGINS_START
+      - name: Create Plugin Directories
+        working-directory: ci
+        run: mkdir -p plugins & mkdir -p themes
+      
+      - name: Download Plugin Activation Stack
+        working-directory: ci/cli
+        env:
+          TOKEN: ${{ secrets.TOKEN }}
+          ACCEPT_HEADER: ${{ secrets.ACCEPT_HEADER }}
+          WOO_DOWNLOAD_URL: ${{ secrets.WOO_DOWNLOAD_URL }}
+          SHA_URL: ${{ secrets.SHA_URL }}
+          CI_ENCRYPTION_KEY: ${{ secrets.CI_ENCRYPTION_KEY }}
+          SHA_POSTFIELDS: ${{ secrets.SHA_POSTFIELDS }}
+          PLUGINS_ZIPS: ${{ toJSON( github.event.client_payload.shared_matrix_data.plugin_zips ) }}
+          PLUGINS_JSON: ${{ toJSON( matrix.test_run.plugins ) }}
+          THEME_DIRECTORY: ${{ github.workspace }}/ci/themes
+          PLUGIN_DIRECTORY: ${{ github.workspace }}/ci/plugins
+          SKIP_CACHE: true
+        run: php src/cli.php download-plugins
+      # DOWNLOAD_PLUGINS_END
+
+      # FIND_ENTRY_POINT_START
+      - name: Identify Plugin or Theme Entry Point
+        working-directory: ci/bin
+        id: find_entry
+        env:
+          PARENT_DIRECTORY: ${{ github.workspace }}/ci/${{ matrix.test_run.sut_type }}s
+          PLUGIN_TYPE: ${{ matrix.test_run.sut_type }}
+          PLUGIN_SLUG: ${{ matrix.test_run.sut_slug }}
+          GITHUB_OUTPUT: $GITHUB_OUTPUT
+        run: php find-plugin-entrypoint.php ${{ env.PARENT_DIRECTORY }} ${{ env.PLUGIN_SLUG }} ${{ env.PLUGIN_TYPE }}
+
+      - name: Display Extracted Information
+        run: |
+          echo "Plugin/Theme Directory: ${{ steps.find_entry.outputs.plugin_directory }}"
+          echo "Entry Point File: ${{ steps.find_entry.outputs.entry_point }}"
+      # FIND_ENTRY_POINT_END
+
+      # SUT_VERSION_START
+      - name: Get SUT version (Debug)
+        if: always()
+        run: ls -la $GITHUB_WORKSPACE/ci/${{ matrix.test_run.sut_type }}s && ls -la $GITHUB_WORKSPACE/ci/${{ matrix.test_run.sut_type }}s/${{ steps.find_entry.outputs.plugin_directory }}
+        
+      - name: Get SUT version (Debug)
+        if: always()
+        id: sut-version
+        working-directory: ci/cli
+        env:
+          PLUGIN_DIRECTORY: ${{ github.workspace }}/ci/${{ matrix.test_run.sut_type }}s/${{ steps.find_entry.outputs.plugin_directory }}
+          PLUGIN_TYPE: ${{ matrix.test_run.sut_type }}
+          PLUGIN_SLUG: ${{ steps.find_entry.outputs.entry_point }}
+        run: php src/cli.php header -o Version
+      # SUT_VERSION_END
+
+      - name: Debug Plugin List
+        working-directory: ci
+        run: pwd && ls -la ./plugins
+
+      - name: Debug Theme List
+        working-directory: ci
+        run: pwd && ls -la ./themes
+
+      - name: Create directories
+        run: mkdir -p env && mkdir cache
+
+      - name: Cache WordPress, WP-CLI and SQLite Plugin
+        uses: actions/cache@v4
+        id: validation-cache
+        with:
+          path: cache
+          key: ${{ env.daily-cache-burst }}-validation-test-cache
+
+      - name: Download WP-CLI
+        if: steps.validation-cache.outputs.cache-hit != 'true'
+        run: curl -L https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o cache/wp-cli.phar
+
+      - name: Download WordPress
+        env:
+          WP_CLI_CACHE_DIR: ${{ github.workspace }}/cache/wp-cli
+        run: php cache/wp-cli.phar --path=$GITHUB_WORKSPACE/env core download --skip-content
+
+      - name: Download the SQLite plugin
+        if: steps.validation-cache.outputs.cache-hit != 'true'
+        run: wget https://downloads.wordpress.org/plugin/sqlite-database-integration.latest-stable.zip -O cache/sqlite-database-integration.zip
+
+      - name: Extract the SQLite plugin into env/wp-content/plugins
+        run: unzip -o cache/sqlite-database-integration.zip -d env/wp-content/plugins
+
+      - name: Place SQLite DB Drop-in
+        run: cp env/wp-content/plugins/sqlite-database-integration/db.copy env/wp-content/db.php
+
+      - name: Copy wp-config-sample.php
+        run: cp env/wp-config-sample.php env/wp-config.php
+
+      - name: Install WordPress
+        run: php cache/wp-cli.phar --path=$GITHUB_WORKSPACE/env core install --url=http://localhost --title=QIT --admin_user=admin --admin_password=admin --admin_email=foo@example.com
+
+      - name: Place the validator
+        run: mkdir env/wp-content/mu-plugins && cp -r ci/tests/validation/validation-plugin.php env/wp-content/mu-plugins/validation-plugin.php
+
+      - name: Install Woo
+        env:
+          WP_CLI_CACHE_DIR: ${{ github.workspace }}/cache/wp-cli
+        run: php cache/wp-cli.phar --path=$GITHUB_WORKSPACE/env plugin install woocommerce
+
+      - name: Place the SUT and stack
+        run: cp -r ci/${{ matrix.test_run.sut_type }}s/* env/wp-content/${{ matrix.test_run.sut_type }}s/
+
+      - name: Activate Woo
+        env:
+          WP_CLI_CACHE_DIR: ${{ github.workspace }}/cache/wp-cli
+        run: php cache/wp-cli.phar --path=$GITHUB_WORKSPACE/env plugin activate woocommerce
+
+      - name: Activate plugin stack
+        if: matrix.test_run.sut_type == 'plugin'
+        env:
+          PLUGINS_JSON: ${{ toJSON( matrix.test_run.plugins ) }}
+          WP_CLI_CACHE_DIR: ${{ github.workspace }}/cache/wp-cli
+        run: echo $PLUGINS_JSON | jq -c '.[] .slug' | xargs -L1 -I'{}' php cache/wp-cli.phar --path=$GITHUB_WORKSPACE/env plugin activate {}
+        # Taken from https://stackoverflow.com/questions/43192556/using-jq-with-bash-to-run-command-for-each-object-in-array
+        # jq outputs the slugs one per line; xargs with -L1 runs line by line and interpolates at the {} in the wp-cli command
+
+      - name: Run the validator
+        run: php cache/wp-cli.phar --path=$GITHUB_WORKSPACE/env qit-validate --type=${{ matrix.test_run.sut_type }} --slug=${{ matrix.test_run.sut_slug }} --sut_directory=${{ steps.find_entry.outputs.plugin_directory }} --sut_entry_point=${{ steps.find_entry.outputs.entry_point }} --output="$GITHUB_WORKSPACE/env/output/validation.json"
+
+      - name: Validate and Read JSON file
+        run: |
+          if test -f $GITHUB_WORKSPACE/env/output/validation.json; then
+            json_content=$(jq -c . $GITHUB_WORKSPACE/env/output/validation.json)
+            echo "TEST_RESULT_JSON=$json_content" >> $GITHUB_ENV
+          fi
+
+      - name: Workflow Cancelled
+        id: workflow-cancelled
+        if: cancelled()
+        run: echo "cancelled=1" >> "$GITHUB_OUTPUT"
+
+      - name: Determine Test Status
+        if: always()
+        run: |
+          if [[ "${{ job.status }}" == "success" ]]; then
+            echo "TEST_RESULT=success" >> $GITHUB_ENV
+          else
+            echo "TEST_RESULT=failed" >> $GITHUB_ENV
+          fi
+
+      - name: Send test result
+        if: always()
+        working-directory: ci/cli
+        run: php src/cli.php notify -r
+        env:
+          TEST_RUN_ID: ${{ matrix.test_run.test_run_id }}
+          CI_SECRET: ${{ secrets.CI_SECRET }}
+          CI_STAGING_SECRET: ${{ secrets.CI_STAGING_SECRET }}
+          MANAGER_HOST: ${{ github.event.client_payload.shared_matrix_data.manager_host }}
+          RESULTS_ENDPOINT: ${{ github.event.client_payload.shared_matrix_data.results_endpoint }}
+          WORKSPACE: ${{ github.workspace }}/ci
+          SUT_VERSION: ${{ steps.sut-version.outputs.header }}
+          CANCELLED: ${{ steps.workflow-cancelled.outputs.cancelled }}
+          # 'TEST_RESULT_JSON' is set by a previous step.
+          # 'TEST_RESULT' is set by a previous step.

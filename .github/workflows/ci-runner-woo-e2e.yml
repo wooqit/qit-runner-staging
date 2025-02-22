@@ -1,0 +1,505 @@
+name: CI Runner - Woo E2E Test
+on:
+  repository_dispatch:
+    types: [cd-test-woo-e2e-playwright]
+jobs:
+  ci-runner-woo-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      QIT_DOCKER_PHP: 'yes'
+      QIT_DOCKER_NGINX: 'yes'
+      QIT_DOCKER_REDIS: 'yes'
+      QIT_DOCKER_MYSQL: 'yes'
+      # JOB_ENV_START
+      PHP_EXTENSIONS: ${{ toJSON( matrix.test_run.environment.php_extensions ) }}
+      QIT_ENABLE_HPOS: ${{ toJSON( matrix.test_run.environment.optional_features.hpos ) }}
+      QIT_ENABLE_NEW_PRODUCT_EDITOR: ${{ toJSON( matrix.test_run.environment.optional_features.new_product_editor ) }}
+      PHP_VERSION: ${{ github.event.client_payload.shared_matrix_data.php_version }}
+      WOOCOMMERCE_VERSION: ${{ matrix.test_run.environment.woocommerce_version }}
+      WORDPRESS_VERSION: ${{ matrix.test_run.environment.wordpress_version }}
+      SUT_SLUG: ${{ matrix.test_run.sut_slug }}
+      SUT_WOO_ID: ${{ matrix.test_run.sut_woo_id }}
+      TEST_TYPE: ${{ matrix.test_run.test_type }}
+      SUT_VERSION: Undefined
+      JOB_NAME: ${{ matrix.test_run.sut_name }} - WP ${{ matrix.test_run.environment.wordpress_version }} - WC ${{ matrix.test_run.environment.woocommerce_version }} - PHP ${{ github.event.client_payload.shared_matrix_data.php_version }}
+      # JOB_ENV_END
+    # JOB_EXTRA_START
+    name: ${{ matrix.test_run.sut_name }} - WP ${{ matrix.test_run.environment.wordpress_version }} - WC ${{ matrix.test_run.environment.woocommerce_version }} - PHP ${{ github.event.client_payload.shared_matrix_data.php_version }}
+      # JOB_EXTRA_END
+    strategy:
+      fail-fast: false
+      matrix:
+        test_run: ${{ github.event.client_payload.test_runs }}
+
+    steps:
+      # HEADER_START
+      - name: Daily Cache Burst.
+        run: echo "daily-cache-burst=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+        
+      - name: Yesterday Cache Burst.
+        run: echo "yesterday-cache-burst=$(date -u -d 'yesterday' +'%Y-%m-%d')" >> $GITHUB_ENV
+
+      - name: Set dynamic environment variables.
+        run: |
+          echo "TEST_TYPE_CACHE_DIR=$GITHUB_WORKSPACE/ci/cache/test-type/${{ matrix.test_run.test_type }}" >> $GITHUB_ENV
+          echo "WP_CLI_CACHE_DIR=$GITHUB_WORKSPACE/ci/cache/test-type/${{ matrix.test_run.test_type }}/wp-cli" >> $GITHUB_ENV
+          echo "PLAYWRIGHT_BROWSERS_PATH=$GITHUB_WORKSPACE/ci/cache/test-type/${{ matrix.test_run.test_type }}/playwright-browsers" >> $GITHUB_ENV
+        
+      - name: Plugin Under Test - ${{ matrix.test_run.sut_name }}
+        run: echo "Starting test for plugin \"${{ matrix.test_run.sut_name }}\""
+        
+      - name: Generate a unique id
+        id: gen-id
+        if: always()
+        run: |
+          echo "rand=$(openssl rand -hex 3)" >> "$GITHUB_OUTPUT"
+          
+      - name: Remove special characters from JOB_NAME
+        if: always()
+        run: |
+          echo "CLEAN_JOB_NAME=$(echo $JOB_NAME | tr -cd '[:alnum:]')" >> $GITHUB_ENV
+        
+      - name: Checkout code.
+        uses: actions/checkout@v4
+      # HEADER_END
+
+      # CLI_SETUP
+      - name: CI CLI Cache
+        id: cache-ci-cli
+        uses: actions/cache@v4
+        with:
+          path: ci/cli/vendor
+          key: ${{ hashFiles( 'ci/cli/composer.lock' ) }}
+
+      - name: CI CLI Setup
+        if: steps.cache-ci-cli.outputs.cache-hit != 'true'
+        working-directory: ci/cli
+        run: composer install --no-interaction --no-progress --no-suggest --prefer-dist --optimize-autoloader --no-dev
+      # CLI_SETUP_END
+
+      # UPDATE_TEST_STATUS_START
+      - name: Notify Manager That Test Has Started
+        id: test-in-progress
+        working-directory: ci/cli
+        env:
+          TEST_RUN_ID: ${{ matrix.test_run.test_run_id }}
+          CI_SECRET: ${{ secrets.CI_SECRET }}
+          CI_STAGING_SECRET: ${{ secrets.CI_STAGING_SECRET }}
+          MANAGER_HOST: ${{ github.event.client_payload.shared_matrix_data.manager_host }}
+          RESULTS_ENDPOINT: ${{ github.event.client_payload.shared_matrix_data.in_progress_endpoint }}
+          TEST_RUN_HASH: ${{ matrix.test_run.custom_payload.hash }}
+          WORKFLOW_ID: ${{ github.run_id }}
+          CANCELLED: ${{ steps.workflow-cancelled.outputs.cancelled }}
+        run: php src/cli.php notify -s
+      # UPDATE_TEST_STATUS_END
+
+      # TEST_TYPE_CACHE_START
+      - name: Restore Test Type Cache (WP CLI Cache (WP zips, plugins zips, etc), Playwright cache if needed, etc)
+        id: cache-qit-daily-test-type
+        uses: actions/cache@v4
+        with:
+          fail-on-cache-miss: false
+          path: ci/cache/test-type
+          key: ${{ env.daily-cache-burst }}-test-type-${{ matrix.test_run.test_type }}-${{ matrix.test_run.environment.woocommerce_version }}-${{ matrix.test_run.environment.wordpress_version }}
+          restore-keys: | # Allow to restore from last day cache if current day doesn't exist.
+            ${{ env.yesterday-cache-burst }}-test-type-${{ matrix.test_run.test_type }}-${{ matrix.test_run.environment.woocommerce_version }}-${{ matrix.test_run.environment.wordpress_version }}
+      # TEST_TYPE_CACHE_END
+
+      # DOCKER_CACHE_START
+      - name: Restore Bundle Docker Image Cache
+        id: cache-docker-bundle
+        uses: actions/cache@v4
+        with:
+          fail-on-cache-miss: false
+          path: ci/cache/docker/bundle/php-${{ github.event.client_payload.shared_matrix_data.php_version }}
+          key: ${{ env.daily-cache-burst }}-cache-docker-bundle-php-${{ github.event.client_payload.shared_matrix_data.php_version }}
+          restore-keys: | # Allow to restore from last day cache if current day doesn't exist.
+            ${{ env.yesterday-cache-burst }}-cache-docker-bundle-php-${{ github.event.client_payload.shared_matrix_data.php_version }}
+
+      - name: Restore Redis Image from Bundle
+        if: env.QIT_DOCKER_REDIS == 'yes' && steps.cache-docker-bundle.outputs.cache-hit == 'true'
+        run: docker image load --input ./ci/cache/docker/bundle/php-${{ github.event.client_payload.shared_matrix_data.php_version }}/redis/image.tar
+
+      - name: Restore MySQL Image from Bundle
+        if: env.QIT_DOCKER_MYSQL == 'yes' && steps.cache-docker-bundle.outputs.cache-hit == 'true'
+        run: docker image load --input ./ci/cache/docker/bundle/php-${{ github.event.client_payload.shared_matrix_data.php_version }}/mysql/image.tar
+
+      - name: Restore PHP Image from Bundle
+        if: env.QIT_DOCKER_PHP == 'yes' && steps.cache-docker-bundle.outputs.cache-hit == 'true'
+        run: docker image load --input ./ci/cache/docker/bundle/php-${{ github.event.client_payload.shared_matrix_data.php_version }}/php-${{ github.event.client_payload.shared_matrix_data.php_version }}/image.tar
+
+      - name: Restore Nginx Image from Bundle
+        if: env.QIT_DOCKER_NGINX == 'yes' && steps.cache-docker-bundle.outputs.cache-hit == 'true'
+        run: docker image load --input ./ci/cache/docker/bundle/php-${{ github.event.client_payload.shared_matrix_data.php_version }}/nginx/image.tar
+
+      - name: Restore Playwright-Related Images from Bundle
+        if: env.QIT_DOCKER_PLAYWRIGHT == 'yes' && steps.cache-docker-bundle.outputs.cache-hit == 'true'
+        run: |
+            docker image load --input ./ci/cache/docker/bundle/php-${{ github.event.client_payload.shared_matrix_data.php_version }}/playwright/image.tar
+            docker image load --input ./ci/cache/docker/bundle/php-${{ github.event.client_payload.shared_matrix_data.php_version }}/zip/image.tar
+            docker image load --input ./ci/cache/docker/bundle/php-${{ github.event.client_payload.shared_matrix_data.php_version }}/busybox/image.tar
+      # DOCKER_CACHE_END
+
+      - name: Setup Dynamic Tests
+        run: cp -r ./ci/synced-tests/woo-e2e-${{ env.WOOCOMMERCE_VERSION }} ./ci/woo-e2e
+
+      - name: Copy synced test output (conditionally)
+        run: |
+          if [ -d "./ci/synced-tests/woo-e2e-${{ env.WOOCOMMERCE_VERSION }}/packages" ]; then
+            cp -r ./ci/synced-tests/woo-e2e-${{ env.WOOCOMMERCE_VERSION }}/packages ./packages
+          fi
+
+          cp ./ci/synced-tests/woo-e2e-${{ env.WOOCOMMERCE_VERSION }}/package.json ./package.json
+          cp ./ci/synced-tests/woo-e2e-${{ env.WOOCOMMERCE_VERSION }}/package-lock.json ./package-lock.json
+
+      - name: Setup Node (pin to Node 20 always)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        env:
+          runner: self-hosted
+        with:
+          tools: none
+          # PS: This PHP version is unrelated to which PHP version will run the test. This is only to run the scripts in GitHub.
+          php-version: '7.4'
+          ini-values: "memory_limit=1G"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Debug Docker
+        working-directory: ci
+        run: docker --version
+
+      - name: Check if WC Pay will be installed
+        id: check-for-wc-pay
+        env:
+          PLUGIN_ACTIVATION_STACK: ${{ toJSON( matrix.test_run.plugins ) }}
+        run: ./.github/workflows/scripts/check-for-wc-pay.sh
+
+      # DOWNLOAD_PLUGINS_START
+      - name: Create Plugin Directories
+        working-directory: ci
+        run: mkdir -p plugins & mkdir -p themes
+      
+      - name: Download Plugin Activation Stack
+        working-directory: ci/cli
+        env:
+          TOKEN: ${{ secrets.TOKEN }}
+          ACCEPT_HEADER: ${{ secrets.ACCEPT_HEADER }}
+          WOO_DOWNLOAD_URL: ${{ secrets.WOO_DOWNLOAD_URL }}
+          SHA_URL: ${{ secrets.SHA_URL }}
+          CI_ENCRYPTION_KEY: ${{ secrets.CI_ENCRYPTION_KEY }}
+          SHA_POSTFIELDS: ${{ secrets.SHA_POSTFIELDS }}
+          PLUGINS_ZIPS: ${{ toJSON( github.event.client_payload.shared_matrix_data.plugin_zips ) }}
+          PLUGINS_JSON: ${{ toJSON( matrix.test_run.plugins ) }}
+          THEME_DIRECTORY: ${{ github.workspace }}/ci/themes
+          PLUGIN_DIRECTORY: ${{ github.workspace }}/ci/plugins
+          SKIP_CACHE: true
+        run: php src/cli.php download-plugins
+      # DOWNLOAD_PLUGINS_END
+
+      # FIND_ENTRY_POINT_START
+      - name: Identify Plugin or Theme Entry Point
+        working-directory: ci/bin
+        id: find_entry
+        env:
+          PARENT_DIRECTORY: ${{ github.workspace }}/ci/${{ matrix.test_run.sut_type }}s
+          PLUGIN_TYPE: ${{ matrix.test_run.sut_type }}
+          PLUGIN_SLUG: ${{ matrix.test_run.sut_slug }}
+          GITHUB_OUTPUT: $GITHUB_OUTPUT
+        run: php find-plugin-entrypoint.php ${{ env.PARENT_DIRECTORY }} ${{ env.PLUGIN_SLUG }} ${{ env.PLUGIN_TYPE }}
+
+      - name: Display Extracted Information
+        run: |
+          echo "Plugin/Theme Directory: ${{ steps.find_entry.outputs.plugin_directory }}"
+          echo "Entry Point File: ${{ steps.find_entry.outputs.entry_point }}"
+      # FIND_ENTRY_POINT_END
+
+      # SUT_VERSION_START
+      - name: Get SUT version (Debug)
+        if: always()
+        run: ls -la $GITHUB_WORKSPACE/ci/${{ matrix.test_run.sut_type }}s && ls -la $GITHUB_WORKSPACE/ci/${{ matrix.test_run.sut_type }}s/${{ steps.find_entry.outputs.plugin_directory }}
+        
+      - name: Get SUT version (Debug)
+        if: always()
+        id: sut-version
+        working-directory: ci/cli
+        env:
+          PLUGIN_DIRECTORY: ${{ github.workspace }}/ci/${{ matrix.test_run.sut_type }}s/${{ steps.find_entry.outputs.plugin_directory }}
+          PLUGIN_TYPE: ${{ matrix.test_run.sut_type }}
+          PLUGIN_SLUG: ${{ steps.find_entry.outputs.entry_point }}
+        run: php src/cli.php header -o Version
+      # SUT_VERSION_END
+
+      - name: Debug Plugins
+        run: ls -la ci/plugins
+
+      - name: Debug Themes
+        run: ls -la ci/themes
+
+      - name: Generate docker-compose
+        env:
+          PHP_VERSION: ${{ github.event.client_payload.shared_matrix_data.php_version }}
+          WITH_CACHE: yes
+          VOLUMES: '{
+            "/ci/plugins": "/var/www/html/wp-content/plugins",
+            "/ci/themes": "/var/www/html/wp-content/themes"
+          }'
+        run: php ./ci/bin/create-docker-compose.php
+
+      - name: Debug Docker Compose
+        run: cat ./ci/bin/docker-compose.yml
+
+      - name: Get UID and GID
+        run: |
+          echo "FIXUID=$(id -u)" >> $GITHUB_ENV
+          echo "FIXGID=$(id -g)" >> $GITHUB_ENV
+
+      - name: Start Docker Compose
+        working-directory: ci/bin
+        timeout-minutes: 5
+        env:
+          FIXUID: ${{ env.FIXUID }}
+          FIXGID: ${{ env.FIXGID }}
+        run: docker compose up -d
+
+      - name: Check Docker Compose Logs
+        working-directory: ci/bin
+        run: docker compose logs ci_runner_php_fpm
+
+      - name: Debug WP-CLI
+        working-directory: ci/bin
+        run: docker exec --user=www-data ci_runner_php_fpm bash -c "wp --info"
+
+      # SETUP_WORDPRESS
+      - name: Setup WordPress
+        working-directory: ci/bin
+        env:
+          PLUGINS_JSON: ${{ toJSON( matrix.test_run.plugins ) }}
+        run: ./wordpress-setup.sh
+      # SETUP_WORDPRESS_END
+
+      - name: Debug wp-config.php
+        run: docker exec --user=root ci_runner_php_fpm bash -c "cat /var/www/html/wp-config.php"
+
+      # Todo: Remove "woocommerce-reset" when we no longer support Woo 8.9.*.
+      - name: Install additional E2E test plugins
+        working-directory: ci/bin
+        run: |
+          ./install-plugin-retry.sh https://github.com/WP-API/Basic-Auth/archive/master.zip
+          ./install-plugin-retry.sh https://github.com/woocommerce/woocommerce-reset/archive/refs/heads/trunk.zip
+          ./install-plugin-retry.sh https://downloads.wordpress.org/plugin/wp-mail-logging.zip
+
+      # DEBUG_PLUGIN_LISTS
+      - name: Debug Plugin List
+        if: ${{ matrix.test_run.sut_type != 'theme' }}
+        working-directory: ci/bin
+        run: docker exec --user=www-data ci_runner_php_fpm bash -c "wp plugin list"
+
+      - name: Debug Theme List
+        if: ${{ matrix.test_run.sut_type == 'theme' }}
+        working-directory: ci/bin
+        run: docker exec --user=www-data ci_runner_php_fpm bash -c "wp theme list"
+      # DEBUG_PLUGIN_LISTS_END
+
+      - name: Debug WordPress Core version
+        run: docker exec --user=www-data ci_runner_php_fpm bash -c "wp core version"
+
+      - name: Verify WordPress Core checksums
+        run: |
+          max_attempts=3
+          attempt=1
+          while [[ $attempt -le $max_attempts ]]; do
+            echo "Attempt $attempt of $max_attempts"
+            docker exec --user=www-data ci_runner_php_fpm bash -c "wp core verify-checksums" && break
+            attempt=$((attempt+1))
+            sleep 2 # wait for 2 seconds before retrying
+          done
+          if [[ $attempt -gt $max_attempts ]]; then
+            docker exec --user=www-data ci_runner_php_fpm bash -c "rm -rf /var/www/html/wp-admin /var/www/html/wp-includes"
+            docker exec --user=www-data ci_runner_php_fpm bash -c "wp core download --version=${WORDPRESS_VERSION} --path=/var/www/html --force --skip-content"
+            echo "Verification failed after $max_attempts attempts, re-installing Core."
+          fi
+
+      - name: Add "qit-runner.test" to /etc/hosts
+        run: sudo echo "127.0.0.1 qit-runner.test" | sudo tee -a /etc/hosts
+
+      - name: Wait for qit-runner.test to be ready
+        run: |
+          TIMEOUT=30
+          ELAPSED=0
+          INTERVAL=3
+          until curl -s -o /dev/null -w "%{http_code}" http://qit-runner.test | grep -q "200" || [ $ELAPSED -eq $TIMEOUT ]; do
+            echo "Waiting for qit-runner.test to return 200... (elapsed time: ${ELAPSED}s)"
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+          if [ $ELAPSED -eq $TIMEOUT ]; then
+            echo "Timeout reached, qit-runner.test did not return 200 within ${TIMEOUT}s."
+            exit 1
+          else
+            echo "qit-runner.test is returning 200, proceeding with the workflow."
+          fi
+
+      - name: Debug API
+        run: curl -i http://qit-runner.test/wp-json/
+
+      - name: Validate PHP extensions
+        run: curl -i "http://qit-runner.test/phpinfo.php?php_extensions=$(echo -n '${{ env.PHP_EXTENSIONS }}' | jq -sRr @uri)"
+
+      - name: Download and install Chromium browser.
+        run: ./node_modules/.bin/playwright install chromium
+
+      - name: Maybe skip some tests at runtime
+        working-directory: ci
+        env:
+          PLUGIN_ACTIVATION_STACK: ${{ toJSON( matrix.test_run.plugins ) }}
+          TEST_DIR: e2e
+        run: php ./bin/add-runtime-test-skips.php
+
+      - name: Check Playwright Version.
+        run: ./node_modules/.bin/playwright --version
+
+      - name: List Playwright E2E tests.
+        working-directory: ci
+        env:
+          BASE_URL: 'http://qit-runner.test'
+          USER_KEY: 'admin'
+          USER_SECRET: 'password'
+          ADMIN_USER_EMAIL: 'wordpress@example.com'
+          WC_PAYMENTS_REQUIRED: ${{ steps.check-for-wc-pay.outputs.wc_pay_required }}
+          # Max 60 seconds per test.
+          DEFAULT_TIMEOUT_OVERRIDE: 60000
+        run: ../node_modules/.bin/playwright test --list --config=./woo-e2e/playwright.config.js --grep-invert="@qit-skip|@skip-on-pressable" --project=ui
+
+      - name: Run Playwright E2E tests.
+        id: run-e2e-tests
+        working-directory: ci
+        env:
+          BASE_URL: 'http://qit-runner.test'
+          USER_KEY: 'admin'
+          USER_SECRET: 'password'
+          ADMIN_USER_EMAIL: 'wordpress@example.com'
+          WC_PAYMENTS_REQUIRED: ${{ steps.check-for-wc-pay.outputs.wc_pay_required }}
+          # Max 60 seconds per test.
+          DEFAULT_TIMEOUT_OVERRIDE: 60000
+          DISABLE_SITE_RESET: 1
+          CTRF_OUTPUT_DIR: 'woo-e2e/ctrf'
+        # Retries also account for "max-failures". So "--max-failures=30" with 2 retries is 10 assertion failures (main + 2 retries).
+        run: ../node_modules/.bin/playwright test --max-failures=30 --config=./woo-e2e/playwright.config.js --grep-invert="@qit-skip|@skip-on-pressable" --project=ui
+
+      - name: Debug E2E Reports
+        if: always()
+        working-directory: ci/e2e
+        run: pwd && ls -la ./
+
+      - name: Check For Allure Results
+        if: always() && steps.run-e2e-tests.outcome != 'success'
+        id: check-allure-results
+        working-directory: ci/e2e
+        run: test -d allure-results
+
+      - name: Update Allure Logo
+        if: always() && steps.check-allure-results.outcome == 'success'
+        id: update-allure-logo
+        working-directory: ci
+        run: echo "  - custom-logo-plugin" >> ../node_modules/allure-commandline/dist/config/allure.yml && cp -rv ./assets/allure/. ../node_modules/allure-commandline/dist/plugins/custom-logo-plugin/static
+
+      - name: Generate Allure Report
+        if: always() && steps.check-allure-results.outcome == 'success'
+        id: generate-allure-report
+        working-directory: ci
+        run: ../node_modules/allure-commandline/bin/allure generate --clean e2e/allure-results --output e2e/allure-report
+
+      - name: Check For Allure Report
+        if: always() && steps.generate-allure-report.outcome == 'success'
+        id: check-allure-report
+        working-directory: ci/e2e
+        run: test -d allure-report
+
+      - name: Configure AWS credentials
+        id: configure-aws
+        if: always() && steps.check-allure-results.outcome == 'success'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ secrets.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Set AWS Destination path
+        if: always() && steps.configure-aws.outcome == 'success'
+        id: set-aws-path
+        working-directory: ci
+        env:
+          BUCKET_URL: ${{ secrets.S3_BUCKET_URL }}
+          S3_ROOT: ${{ secrets.S3_ROOT }}
+        run: ./bin/results/set-aws-path.sh
+
+      - name: Upload test reports to S3 bucket
+        id: aws-upload
+        if: always() && steps.set-aws-path.outcome == 'success'
+        working-directory: ci
+        env:
+          REPORT_DESTINATION: ${{ steps.set-aws-path.outputs.report_path }}
+        run: aws s3 sync e2e/allure-report $REPORT_DESTINATION --delete
+
+      - name: Generate AWS Data
+        if: always() && steps.aws-upload.outcome == 'success'
+        id: create-presign
+        working-directory: ci
+        env:
+          S3_DOMAIN: s3.amazonaws.com
+          BUCKET: ${{ secrets.S3_BUCKET_URL }}
+          S3_ROOT: ${{ secrets.S3_ROOT }}
+          OBJECT_ID: ${{ steps.set-aws-path.outputs.id }}
+        run: ./bin/results/generate-aws-data.sh
+
+      - name: Export debug.log
+        if: always()
+        id: export-debug-log
+        working-directory: ci
+        run: docker exec --user=www-data ci_runner_php_fpm bash -c "cat /var/www/html/wp-content/debug.log" > ./debug.log || rm debug.log && exit 0
+
+      - name: Prepare debug log
+        if: always()
+        env:
+          PHP_VERSION: ${{ github.event.client_payload.shared_matrix_data.php_version }}
+          WP_VERSION: ${{ matrix.test_run.environment.wordpress_version }}
+        run: php ./ci/bin/results/prepare-debug-log.php
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          retention-days: 7
+          name: debug-logs-${{ steps.gen-id.outputs.rand }}-${{ env.CLEAN_JOB_NAME }}
+          path: |
+            ./ci/debug.log
+            ./ci/debug_prepared.log
+
+      - name: Workflow Cancelled
+        id: workflow-cancelled
+        if: cancelled()
+        run: echo "cancelled=1" >> "$GITHUB_OUTPUT"
+
+      - name: Send test result
+        if: always()
+        working-directory: ci/cli
+        run: php src/cli.php notify -r -p
+        env:
+          TEST_RUN_ID: ${{ matrix.test_run.test_run_id }}
+          CI_SECRET: ${{ secrets.CI_SECRET }}
+          CI_STAGING_SECRET: ${{ secrets.CI_STAGING_SECRET }}
+          MANAGER_HOST: ${{ github.event.client_payload.shared_matrix_data.manager_host }}
+          RESULTS_ENDPOINT: ${{ github.event.client_payload.shared_matrix_data.results_endpoint }}
+          TEST_RESULT: ${{ steps.run-e2e-tests.outcome }}
+          PARTIAL_PATH: woo-e2e/e2e/test-results.json
+          CTRF_PARTIAL_PATH: woo-e2e/ctrf/ctrf-report.json
+          WORKSPACE: ${{ github.workspace }}/ci
+          SUT_VERSION: ${{ steps.sut-version.outputs.header }}
+          CANCELLED: ${{ steps.workflow-cancelled.outputs.cancelled }}
