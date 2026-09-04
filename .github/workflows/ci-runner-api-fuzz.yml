@@ -1,0 +1,222 @@
+name: CI Runner - API Fuzz
+
+on:
+  repository_dispatch:
+    types: [cd-test-api-fuzz]
+
+permissions:
+  contents: read
+
+jobs:
+  authenticate:
+    runs-on: ubuntu-24.04
+    env:
+      QIT_HOME: ${{ github.workspace }}/qit-home
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Daily cache burst
+        run: echo "daily-cache-burst=$(date +'%Y-%m-%d')" >> "$GITHUB_ENV"
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          ini-values: memory_limit=1G
+
+      - name: Restore QIT authentication
+        id: cache-qit-cli-auth
+        uses: actions/cache@v4
+        with:
+          path: qit-home/*.json
+          key: ${{ env.daily-cache-burst }}-${{ vars.ENVIRONMENT }}-qit-home-auth-bypass
+
+      - name: Enable QIT dev mode
+        working-directory: ci/tests/woo-api
+        if: ${{ vars.ENVIRONMENT == 'staging' && steps.cache-qit-cli-auth.outputs.cache-hit != 'true' }}
+        run: ./qit dev
+
+      - name: Connect to staging QIT
+        working-directory: ci/tests/woo-api
+        if: ${{ vars.ENVIRONMENT == 'staging' && steps.cache-qit-cli-auth.outputs.cache-hit != 'true' }}
+        run: ./qit backend:add --environment=staging --qit_secret="${{ secrets.MANAGER_SECRET_STAGING }}" --manager_url=https://stagingcompatibilitydashboard.wpcomstaging.com
+
+      - name: Connect to production QIT
+        working-directory: ci/tests/woo-api
+        if: ${{ vars.ENVIRONMENT == 'production' && steps.cache-qit-cli-auth.outputs.cache-hit != 'true' }}
+        run: ./qit partner:add --user="${{ secrets.PARTNER_USER }}" --application_password="${{ secrets.PARTNER_SECRET }}"
+
+  api-fuzz:
+    runs-on: ubuntu-24.04
+    needs: authenticate
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        test_run: ${{ github.event.client_payload.test_runs }}
+    env:
+      QIT_DOCKER_PHP: 'yes'
+      QIT_DOCKER_NGINX: 'yes'
+      QIT_DOCKER_REDIS: 'no'
+      QIT_DOCKER_MYSQL: 'yes'
+      QIT_HOME: ${{ github.workspace }}/qit-home
+      PHP_VERSION: ${{ github.event.client_payload.shared_matrix_data.php_version }}
+      WOOCOMMERCE_VERSION: ${{ matrix.test_run.environment.woocommerce_version }}
+      WORDPRESS_VERSION: ${{ matrix.test_run.environment.wordpress_version }}
+      SUT_SLUG: ${{ matrix.test_run.sut_slug }}
+      SUT_WOO_ID: ${{ matrix.test_run.sut_woo_id }}
+      SUT_VERSION: ${{ matrix.test_run.sut_version }}
+      TEST_TYPE: ${{ matrix.test_run.test_type }}
+    name: ${{ matrix.test_run.sut_name }} - WP ${{ matrix.test_run.environment.wordpress_version }} - WC ${{ matrix.test_run.environment.woocommerce_version }} - PHP ${{ github.event.client_payload.shared_matrix_data.php_version }}
+    steps:
+      - name: Daily cache burst
+        run: echo "daily-cache-burst=$(date +'%Y-%m-%d')" >> "$GITHUB_ENV"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          ini-values: memory_limit=1G
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: ci/tests/api-fuzz/requirements.txt
+
+      - name: Restore CI CLI dependencies
+        id: cache-ci-cli
+        uses: actions/cache@v4
+        with:
+          path: ci/cli/vendor
+          key: ${{ hashFiles('ci/cli/composer.lock') }}
+
+      - name: Install CI CLI dependencies
+        if: steps.cache-ci-cli.outputs.cache-hit != 'true'
+        working-directory: ci/cli
+        run: composer install --no-interaction --no-progress --no-suggest --prefer-dist --optimize-autoloader --no-dev
+
+      - name: Notify Manager that test started
+        working-directory: ci/cli
+        env:
+          TEST_RUN_ID: ${{ matrix.test_run.test_run_id }}
+          TEST_RUN_HASH: ${{ matrix.test_run.custom_payload.hash }}
+          CI_SECRET: ${{ secrets.CI_SECRET }}
+          CI_STAGING_SECRET: ${{ secrets.CI_STAGING_SECRET }}
+          MANAGER_HOST: ${{ github.event.client_payload.shared_matrix_data.manager_host }}
+          RESULTS_ENDPOINT: ${{ github.event.client_payload.shared_matrix_data.in_progress_endpoint }}
+          WORKFLOW_ID: ${{ github.run_id }}
+          WORKSPACE: ${{ github.workspace }}/ci
+        run: php src/cli.php notify -s
+
+      - name: Create extension directories
+        working-directory: ci
+        run: mkdir -p plugins themes results
+
+      - name: Download plugin activation stack
+        working-directory: ci/cli
+        env:
+          TOKEN: ${{ secrets.TOKEN }}
+          ACCEPT_HEADER: ${{ secrets.ACCEPT_HEADER }}
+          WOO_DOWNLOAD_URL: ${{ secrets.WOO_DOWNLOAD_URL }}
+          SHA_URL: ${{ secrets.SHA_URL }}
+          CI_ENCRYPTION_KEY: ${{ secrets.CI_ENCRYPTION_KEY }}
+          SHA_POSTFIELDS: ${{ secrets.SHA_POSTFIELDS }}
+          PLUGINS_ZIPS: ${{ toJSON(github.event.client_payload.shared_matrix_data.plugin_zips) }}
+          PLUGINS_JSON: ${{ toJSON(matrix.test_run.plugins) }}
+          THEME_DIRECTORY: ${{ github.workspace }}/ci/themes
+          PLUGIN_DIRECTORY: ${{ github.workspace }}/ci/plugins
+          QIT_FAILURE_OUTPUT: ${{ github.workspace }}/ci/results/api-fuzz-setup-failure.json
+          SKIP_CACHE: true
+        run: php src/cli.php download-plugins
+
+      - name: Identify SUT entry point
+        id: find_entry
+        working-directory: ci/bin
+        env:
+          PARENT_DIRECTORY: ${{ github.workspace }}/ci/${{ matrix.test_run.sut_type }}s
+          PLUGIN_TYPE: ${{ matrix.test_run.sut_type }}
+          PLUGIN_SLUG: ${{ matrix.test_run.sut_slug }}
+          QIT_FAILURE_OUTPUT: ${{ github.workspace }}/ci/results/api-fuzz-setup-failure.json
+          GITHUB_OUTPUT: $GITHUB_OUTPUT
+        run: php find-plugin-entrypoint.php "$PARENT_DIRECTORY" "$PLUGIN_SLUG" "$PLUGIN_TYPE"
+
+      - name: Read SUT version
+        id: sut-version
+        working-directory: ci/cli
+        env:
+          PLUGIN_DIRECTORY: ${{ github.workspace }}/ci/${{ matrix.test_run.sut_type }}s/${{ steps.find_entry.outputs.plugin_directory }}
+          PLUGIN_TYPE: ${{ matrix.test_run.sut_type }}
+          PLUGIN_SLUG: ${{ steps.find_entry.outputs.entry_point }}
+        run: php src/cli.php header -o Version
+
+      - name: Restore QIT authentication
+        uses: actions/cache@v4
+        with:
+          path: qit-home/*.json
+          fail-on-cache-miss: true
+          key: ${{ env.daily-cache-burst }}-${{ vars.ENVIRONMENT }}-qit-home-auth-bypass
+
+      - name: Restore QIT download cache
+        uses: actions/cache@v4
+        with:
+          path: qit-home/cache
+          key: ${{ env.daily-cache-burst }}-${{ vars.ENVIRONMENT }}-qit-home-cache
+
+      - name: Install API-fuzz dependencies
+        run: python -m pip install --require-hashes -r ci/tests/api-fuzz/requirements.txt
+
+      - name: Run schema-driven API fuzz campaign
+        id: run-api-fuzz
+        continue-on-error: true
+        env:
+          PLUGINS_JSON: ${{ toJSON(matrix.test_run.plugins) }}
+          SUT_VERSION: ${{ steps.sut-version.outputs.header }}
+          SUT_SOURCE_DIRECTORY: ${{ steps.find_entry.outputs.plugin_directory }}
+        run: PYTHONPATH=ci/tests/api-fuzz python -m qit_api_fuzz.runner
+
+      - name: Mark workflow cancellation
+        id: workflow-cancelled
+        if: cancelled()
+        run: echo "cancelled=1" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure structured API fuzz result
+        if: always()
+        env:
+          RESULT_PATH: ${{ github.workspace }}/ci/results/api-fuzz-results.json
+          FAILURE_PATH: ${{ github.workspace }}/ci/results/api-fuzz-setup-failure.json
+          CANCELLED: ${{ steps.workflow-cancelled.outputs.cancelled }}
+          SUT_VERSION: ${{ steps.sut-version.outputs.header || matrix.test_run.sut_version }}
+        run: PYTHONPATH=ci/tests/api-fuzz python -m qit_api_fuzz.finalize_result
+
+      - name: Send result to Manager
+        if: always()
+        working-directory: ci/cli
+        env:
+          TEST_RUN_ID: ${{ matrix.test_run.test_run_id }}
+          CI_SECRET: ${{ secrets.CI_SECRET }}
+          CI_STAGING_SECRET: ${{ secrets.CI_STAGING_SECRET }}
+          MANAGER_HOST: ${{ github.event.client_payload.shared_matrix_data.manager_host }}
+          RESULTS_ENDPOINT: ${{ github.event.client_payload.shared_matrix_data.results_endpoint }}
+          WORKSPACE: ${{ github.workspace }}/ci
+          SUT_VERSION: ${{ steps.sut-version.outputs.header || matrix.test_run.sut_version }}
+          CANCELLED: ${{ steps.workflow-cancelled.outputs.cancelled }}
+          TEST_RESULT: ${{ steps.run-api-fuzz.outcome == 'success' && 'success' || 'failed' }}
+          TEST_RESULT_JSON: results/api-fuzz-results.json
+        run: php src/cli.php notify -r -g
+
+      - name: Upload private fuzz artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-fuzz-${{ matrix.test_run.test_run_id }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            ci/results/api-fuzz-results.json
+            ci/tests/api-fuzz/test-package/artifacts/

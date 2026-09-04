@@ -1,0 +1,28 @@
+{
+  "$schema": "https://raw.githubusercontent.com/woocommerce/qit-cli/trunk/src/src/PreCommand/Schemas/test-package-manifest-schema.json",
+  "package": "woocommerce/compatibility-smoke-tests",
+  "test_type": "compatibility",
+  "description": "Generic compatibility smoke probes for a requested WooCommerce extension stack.",
+  "requires": {
+    "plugins": ["woocommerce"]
+  },
+  "test": {
+    "phases": {
+      "globalSetup": [
+        "wp plugin activate woocommerce --path=/var/www/html",
+        "wp option update woocommerce_onboarding_profile_completed yes --path=/var/www/html",
+        "wp option update woocommerce_redirect_to_setup no --path=/var/www/html",
+        "wp option update woocommerce_onboarding_profile '{\"completed\":true,\"skipped\":true}' --format=json --path=/var/www/html",
+        "wp option update woocommerce_coming_soon no --path=/var/www/html",
+        "wp option update woocommerce_store_pages_only no --path=/var/www/html"
+      ],
+      "run": [
+        "php ./bin/compatibility-smoke.php"
+      ],
+      "teardown": []
+    },
+    "results": {
+      "ctrf-json": "./results/ctrf-report.json"
+    }
+  }
+}

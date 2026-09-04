@@ -1,0 +1,516 @@
+name: CI Runner PHPStan Regression
+on:
+  repository_dispatch:
+    types: [cd-test-compatibility-regression]
+jobs:
+  ci-runner-phpstan-regression:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        test_run: ${{ github.event.client_payload.test_runs }}
+    env:
+      PHP_EXTENSIONS: ${{ toJSON( matrix.test_run.environment.php_extensions ) }}
+      QIT_ENABLE_HPOS: ${{ toJSON( matrix.test_run.environment.optional_features.hpos ) }}
+      QIT_ENABLE_NEW_PRODUCT_EDITOR: ${{ toJSON( matrix.test_run.environment.optional_features.new_product_editor ) }}
+      PHP_VERSION: ${{ github.event.client_payload.shared_matrix_data.php_version }}
+      BASELINE_WOOCOMMERCE_VERSION: ${{ matrix.test_run.environment.baseline_woocommerce_version }}
+      WOOCOMMERCE_VERSION: ${{ matrix.test_run.environment.woocommerce_version }}
+      WORDPRESS_VERSION: ${{ matrix.test_run.environment.wordpress_version }}
+      SUT_SLUG: ${{ matrix.test_run.sut_slug }}
+      SUT_WOO_ID: ${{ matrix.test_run.sut_woo_id }}
+      TEST_TYPE: ${{ matrix.test_run.test_type }}
+      SUT_VERSION: ${{ matrix.test_run.sut_version }}
+      JOB_NAME: ${{ matrix.test_run.sut_name }}
+      REGRESSION_RESULT: failure
+    name: ${{ matrix.test_run.sut_name }}
+    steps:
+      - name: Daily Cache Burst.
+        run: echo "daily-cache-burst=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+
+      - name: Yesterday Cache Burst.
+        run: echo "yesterday-cache-burst=$(date -u -d 'yesterday' +'%Y-%m-%d')" >> $GITHUB_ENV
+
+      - name: Set dynamic environment variables.
+        run: |
+          echo "TEST_TYPE_CACHE_DIR=$GITHUB_WORKSPACE/ci/cache/test-type/${{ matrix.test_run.test_type }}" >> $GITHUB_ENV
+          echo "WP_CLI_CACHE_DIR=$GITHUB_WORKSPACE/ci/cache/test-type/${{ matrix.test_run.test_type }}/wp-cli" >> $GITHUB_ENV
+          echo "PLAYWRIGHT_BROWSERS_PATH=$GITHUB_WORKSPACE/ci/cache/test-type/${{ matrix.test_run.test_type }}/playwright-browsers" >> $GITHUB_ENV
+
+      - name: Plugin Under Test - ${{ matrix.test_run.sut_name }}
+        run: echo "Starting compatibility regression check for plugin \"${{ matrix.test_run.sut_name }}\""
+
+      - name: Generate a unique id
+        id: gen-id
+        if: always()
+        run: |
+          echo "rand=$(openssl rand -hex 3)" >> "$GITHUB_OUTPUT"
+
+      - name: Remove special characters from JOB_NAME
+        if: always()
+        run: |
+          echo "CLEAN_JOB_NAME=$(echo $JOB_NAME | tr -cd '[:alnum:]')" >> $GITHUB_ENV
+
+      - name: Checkout code.
+        uses: actions/checkout@v4
+
+      # Stubz and its BetterReflection dependency require PHP 8.2+, independently
+      # of the PHP version the extension is being analyzed against.
+      - name: Setup PHP tooling runtime
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+          ini-values: memory_limit=1G
+
+      - name: CI CLI Cache
+        id: cache-ci-cli
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: ci/cli/vendor
+          key: ${{ hashFiles( 'ci/cli/composer.lock' ) }}
+
+      - name: CI CLI Setup
+        if: always() && steps.cache-ci-cli.outputs.cache-hit != 'true'
+        working-directory: ci/cli
+        run: composer install --no-interaction --no-progress --no-suggest --prefer-dist --optimize-autoloader --no-dev
+
+      - name: Notify Manager That Test Has Started
+        id: test-in-progress
+        working-directory: ci/cli
+        env:
+          TEST_RUN_ID: ${{ matrix.test_run.test_run_id }}
+          CI_SECRET: ${{ secrets.CI_SECRET }}
+          CI_STAGING_SECRET: ${{ secrets.CI_STAGING_SECRET }}
+          MANAGER_HOST: ${{ github.event.client_payload.shared_matrix_data.manager_host }}
+          RESULTS_ENDPOINT: ${{ github.event.client_payload.shared_matrix_data.in_progress_endpoint }}
+          TEST_RUN_HASH: ${{ matrix.test_run.custom_payload.hash }}
+          WORKFLOW_ID: ${{ github.run_id }}
+          CANCELLED: false
+        run: php src/cli.php notify -s
+
+      - name: Restore Test Type Cache
+        id: cache-qit-daily-test-type
+        uses: actions/cache@v4
+        with:
+          fail-on-cache-miss: false
+          path: ci/cache/test-type
+          key: ${{ env.daily-cache-burst }}-test-type-${{ matrix.test_run.test_type }}-${{ matrix.test_run.environment.baseline_woocommerce_version }}-${{ matrix.test_run.environment.woocommerce_version }}-${{ matrix.test_run.environment.wordpress_version }}
+          restore-keys: |
+            ${{ env.yesterday-cache-burst }}-test-type-${{ matrix.test_run.test_type }}-${{ matrix.test_run.environment.baseline_woocommerce_version }}-${{ matrix.test_run.environment.woocommerce_version }}-${{ matrix.test_run.environment.wordpress_version }}
+
+      - name: Create Temporary WordPress directory
+        run: mkdir -p ci/tmp/wordpress
+
+      - name: Create Cache dir
+        run: mkdir -p "$WP_CLI_CACHE_DIR" "$TEST_TYPE_CACHE_DIR/woocommerce"
+
+      - name: Download WordPress Core
+        working-directory: ci/tmp/wordpress
+        run: php $GITHUB_WORKSPACE/ci/tests/phpstan/wp-cli.phar core download --version=${{ matrix.test_run.environment.wordpress_version }}
+
+      - name: Download WooCommerce Baseline and Target
+        id: download-woocommerce
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          failure_path="$GITHUB_WORKSPACE/ci/tests/phpstan/download-failure.json"
+
+          write_artifact_failure() {
+            local code="$1"
+            local version="$2"
+            local message="$3"
+            FAILURE_PATH="$failure_path" \
+              FAILURE_CODE="$code" \
+              FAILURE_VERSION="$version" \
+              FAILURE_MESSAGE="$message" \
+              php -r '$message = trim(preg_replace("/[\\x00-\\x1F\\x7F]+/", " ", getenv("FAILURE_MESSAGE")) ?? ""); $version = trim(getenv("FAILURE_VERSION")); $subject = $version === "" ? "WooCommerce artifact failure" : sprintf("WooCommerce %s artifact failure", $version); file_put_contents(getenv("FAILURE_PATH"), json_encode(["stage" => "analysis", "code" => getenv("FAILURE_CODE"), "message" => sprintf("%s: %s", $subject, $message)], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL);'
+          }
+
+          validate_woocommerce_artifact() {
+            local artifact="$1"
+            unzip -tq "$artifact" >/dev/null 2>&1 &&
+              unzip -Z1 "$artifact" | grep -Fxq "woocommerce/woocommerce.php"
+          }
+
+          download_woocommerce_artifact() {
+            local version="$1"
+            local destination="$TEST_TYPE_CACHE_DIR/woocommerce/woocommerce-${version}.zip"
+            local temporary="${destination}.tmp-${GITHUB_RUN_ID}-${RANDOM}"
+            local invalid_response=0
+            local source_url=""
+            local urls=(
+              "https://downloads.wordpress.org/plugin/woocommerce.${version}.zip"
+              "https://github.com/woocommerce/woocommerce/releases/download/${version}/woocommerce.zip"
+            )
+
+            if [ -f "$destination" ]; then
+              if validate_woocommerce_artifact "$destination"; then
+                echo "Using validated cached WooCommerce ${version} artifact."
+                return 0
+              fi
+
+              echo "Discarding invalid cached WooCommerce ${version} artifact."
+              rm -f "$destination"
+            fi
+
+            for source_url in "${urls[@]}"; do
+              echo "Downloading WooCommerce ${version} from ${source_url}"
+              rm -f "$temporary"
+              if ! curl --fail --location --retry 3 --retry-all-errors --connect-timeout 20 --create-dirs --output "$temporary" "$source_url"; then
+                continue
+              fi
+
+              if ! validate_woocommerce_artifact "$temporary"; then
+                echo "Downloaded WooCommerce ${version} artifact from ${source_url} is not a valid WooCommerce ZIP archive."
+                invalid_response=1
+                continue
+              fi
+
+              mv "$temporary" "$destination"
+              echo "Cached validated WooCommerce ${version} artifact from ${source_url}."
+              return 0
+            done
+
+            rm -f "$temporary"
+            if [ "$invalid_response" -eq 1 ]; then
+              write_artifact_failure \
+                "woocommerce_artifact_invalid" \
+                "$version" \
+                "downloaded content was not a valid WooCommerce ZIP archive after trying WordPress.org and GitHub release sources."
+            else
+              write_artifact_failure \
+                "woocommerce_artifact_unavailable" \
+                "$version" \
+                "download failed after trying WordPress.org and GitHub release sources."
+            fi
+            return 1
+          }
+
+          for version in "$BASELINE_WOOCOMMERCE_VERSION" "$WOOCOMMERCE_VERSION"; do
+            if [ -z "$version" ]; then
+              write_artifact_failure \
+                "woocommerce_artifact_unavailable" \
+                "$version" \
+                "baseline and target versions are required."
+              exit 1
+            fi
+
+            download_woocommerce_artifact "$version"
+          done
+
+      - name: Debug WooCommerce Cache
+        run: |
+          if [ -d "$TEST_TYPE_CACHE_DIR/woocommerce" ]; then
+            ls -la "$TEST_TYPE_CACHE_DIR/woocommerce"
+          else
+            echo "WooCommerce cache directory was not created."
+          fi
+
+      - name: Create Plugin Directories
+        working-directory: ci
+        run: mkdir -p plugins themes
+
+      - name: Download Plugin Activation Stack
+        working-directory: ci/cli
+        env:
+          TOKEN: ${{ secrets.QIT_COMPATIBILITY_GITHUB_TOKEN || secrets.TOKEN }}
+          ACCEPT_HEADER: ${{ secrets.ACCEPT_HEADER }}
+          WOO_DOWNLOAD_URL: ${{ secrets.WOO_DOWNLOAD_URL }}
+          SHA_URL: ${{ secrets.SHA_URL }}
+          CI_ENCRYPTION_KEY: ${{ secrets.CI_ENCRYPTION_KEY }}
+          SHA_POSTFIELDS: ${{ secrets.SHA_POSTFIELDS }}
+          PLUGINS_ZIPS: ${{ toJSON( github.event.client_payload.shared_matrix_data.plugin_zips ) }}
+          PLUGINS_JSON: ${{ toJSON( matrix.test_run.plugins ) }}
+          THEME_DIRECTORY: ${{ github.workspace }}/ci/themes
+          PLUGIN_DIRECTORY: ${{ github.workspace }}/ci/plugins
+          SKIP_CACHE: true
+          QIT_FAILURE_OUTPUT: ${{ github.workspace }}/ci/tests/phpstan/download-failure.json
+        run: php src/cli.php download-plugins
+
+      - name: Identify Plugin or Theme Entry Point
+        working-directory: ci/bin
+        id: find_entry
+        env:
+          PARENT_DIRECTORY: ${{ github.workspace }}/ci/${{ matrix.test_run.sut_type }}s
+          PLUGIN_TYPE: ${{ matrix.test_run.sut_type }}
+          PLUGIN_SLUG: ${{ matrix.test_run.sut_slug }}
+          QIT_FAILURE_OUTPUT: ${{ github.workspace }}/ci/tests/phpstan/download-failure.json
+          GITHUB_OUTPUT: $GITHUB_OUTPUT
+        run: php find-plugin-entrypoint.php ${{ env.PARENT_DIRECTORY }} ${{ env.PLUGIN_SLUG }} ${{ env.PLUGIN_TYPE }}
+
+      - name: Get SUT version
+        if: always()
+        id: sut-version
+        working-directory: ci/cli
+        env:
+          PLUGIN_DIRECTORY: ${{ github.workspace }}/ci/${{ matrix.test_run.sut_type }}s/${{ steps.find_entry.outputs.plugin_directory }}
+          PLUGIN_TYPE: ${{ matrix.test_run.sut_type }}
+          PLUGIN_SLUG: ${{ steps.find_entry.outputs.entry_point }}
+        run: php src/cli.php header -o Version
+
+      - uses: actions/cache@v4
+        id: cache-runner-phpstan
+        with:
+          path: ci/tests/phpstan/vendor
+          key: ${{ runner.os }}-${{ hashFiles('ci/tests/phpstan/composer.lock') }}
+
+      - name: Composer install
+        if: steps.cache-runner-phpstan.outputs.cache-hit != 'true'
+        working-directory: ci/tests/phpstan
+        run: composer install --prefer-dist
+
+      - name: Generate stubs for SUT
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/ci/stubs/${{ matrix.test_run.sut_type }}s"
+          find "$GITHUB_WORKSPACE/ci/${{ matrix.test_run.sut_type }}s" -mindepth 1 -maxdepth 1 -type d | while read item_path; do
+            item_name="$(basename "$item_path")"
+            echo "Generating stubs for $item_name"
+            mkdir -p "$GITHUB_WORKSPACE/ci/stubs/${{ matrix.test_run.sut_type }}s/$item_name"
+
+            stub_log="$GITHUB_WORKSPACE/ci/tests/phpstan/stub-generation.log"
+            set +e
+            php "$GITHUB_WORKSPACE/ci/tests/phpstan/vendor/bin/stubz" \
+              "$item_path" \
+              "$GITHUB_WORKSPACE/ci/stubs/${{ matrix.test_run.sut_type }}s/$item_name" \
+              --exclude generated \
+              --exclude tests \
+              --exclude vendor 2>&1 | tee "$stub_log"
+            stub_exit="${PIPESTATUS[0]}"
+            set -e
+
+            if [ "$stub_exit" -ne 0 ]; then
+              stub_error="$(grep -m1 -E 'Error processing file|DEBUG: parse failure' "$stub_log" || true)"
+              STUB_FAILURE_PATH="$GITHUB_WORKSPACE/ci/tests/phpstan/download-failure.json" \
+                STUB_ITEM="$item_name" \
+                STUB_ERROR="$stub_error" \
+                php -r '$path = getenv("STUB_FAILURE_PATH"); if (!is_file($path)) { $detail = trim(preg_replace("/[\\x00-\\x1F\\x7F]+/", " ", getenv("STUB_ERROR")) ?? ""); $message = sprintf("Could not generate PHP stubs for %s", getenv("STUB_ITEM")); if ($detail !== "") { $message .= ": " . $detail; } file_put_contents($path, json_encode(["stage" => "analysis", "code" => "stub_generation_error", "message" => $message . "."], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL); }'
+              exit "$stub_exit"
+            fi
+          done
+
+      - name: Setup requested PHP runtime
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: ${{ join(matrix.test_run.environment.php_extensions, ',') }}
+          coverage: none
+          ini-values: memory_limit=1G
+
+      - name: Verify requested PHP runtime
+        id: verify-runtime
+        run: |
+          set -euo pipefail
+          requested_version="$(php -r 'if (preg_match("/^(\\d+\\.\\d+)/", getenv("PHP_VERSION"), $matches)) { echo $matches[1]; }')"
+          actual_version="$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')"
+          actual_full_version="$(php -r 'echo PHP_VERSION;')"
+          missing_extensions="$(php -r '$requested = json_decode(getenv("PHP_EXTENSIONS"), true); $missing = []; foreach (is_array($requested) ? $requested : [] as $extension) { if (is_string($extension) && !extension_loaded($extension)) { $missing[] = $extension; } } echo json_encode($missing);')"
+          verified_extensions="$(php -r '$requested = json_decode(getenv("PHP_EXTENSIONS"), true); $loaded = []; foreach (is_array($requested) ? $requested : [] as $extension) { if (is_string($extension) && extension_loaded($extension)) { $loaded[] = $extension; } } echo json_encode($loaded);')"
+
+          echo "requested_version=$requested_version"
+          echo "actual_version=$actual_full_version"
+          echo "verified_extensions=$verified_extensions"
+          echo "actual_version=$actual_full_version" >> "$GITHUB_OUTPUT"
+          echo "verified_extensions=$verified_extensions" >> "$GITHUB_OUTPUT"
+
+          if [ "$requested_version" != "$actual_version" ] || [ "$missing_extensions" != "[]" ]; then
+            echo "valid=0" >> "$GITHUB_OUTPUT"
+            RUNTIME_FAILURE_PATH="$GITHUB_WORKSPACE/ci/tests/phpstan/runtime-failure.json" \
+              REQUESTED_VERSION="$PHP_VERSION" \
+              ACTUAL_VERSION="$actual_full_version" \
+              MISSING_EXTENSIONS="$missing_extensions" \
+              php -r '$missing = json_decode(getenv("MISSING_EXTENSIONS"), true); $message = sprintf("Requested PHP %s but actual runtime is %s; missing extensions: %s.", getenv("REQUESTED_VERSION"), getenv("ACTUAL_VERSION"), empty($missing) ? "none" : implode(", ", $missing)); file_put_contents(getenv("RUNTIME_FAILURE_PATH"), json_encode(["stage" => "setup", "code" => "php_runtime_mismatch", "message" => $message], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL);'
+            RUNTIME_METADATA="$(ACTUAL_VERSION="$actual_full_version" VERIFIED_EXTENSIONS="$verified_extensions" php -r 'echo json_encode(["requested_php_version" => getenv("PHP_VERSION"), "actual_php_version" => getenv("ACTUAL_VERSION"), "php_extensions" => json_decode(getenv("VERIFIED_EXTENSIONS"), true) ?: []]);')"
+            RESULT_PATH="$GITHUB_WORKSPACE/ci/tests/phpstan/compat-regression.json" \
+              FAILURE_PATH="$GITHUB_WORKSPACE/ci/tests/phpstan/runtime-failure.json" \
+              RUNTIME_METADATA="$RUNTIME_METADATA" \
+              php -r 'require getenv("GITHUB_WORKSPACE") . "/ci/cli/src/CompatibilityRegressionUnavailableResult.php"; \CI_CLI\CompatibilityRegressionUnavailableResult::write_if_missing(getenv("RESULT_PATH"), getenv("FAILURE_PATH"), ["baseline_woocommerce_version" => getenv("BASELINE_WOOCOMMERCE_VERSION") ?: "", "target_woocommerce_version" => getenv("WOOCOMMERCE_VERSION") ?: "", "sut_version" => getenv("SUT_VERSION") ?: "", "runtime" => json_decode(getenv("RUNTIME_METADATA"), true) ?: []]);'
+            exit 1
+          fi
+
+          echo "valid=1" >> "$GITHUB_OUTPUT"
+
+      - name: Run Baseline and Target PHPStan
+        id: run-phpstan-passes
+        if: steps.download-woocommerce.outcome == 'success' && steps.verify-runtime.outputs.valid == '1'
+        timeout-minutes: 30
+        env:
+          SUT_TYPE: ${{ matrix.test_run.sut_type }}
+          PLUGINS_JSON: ${{ toJSON( matrix.test_run.plugins ) }}
+          PHPSTAN_LEVEL: ${{ matrix.test_run.custom_payload.phpstan_level }}
+          # Exclude the SUT's own PHPStan config so pinned woocommerce-stubs cannot shadow the
+          # real, swapped WC source and collapse the baseline/target diff to a false pass.
+          PHPSTAN_REGRESSION_MODE: '1'
+          SUT_DIRECTORY: ${{ github.workspace }}/ci/${{ matrix.test_run.sut_type }}s/${{ steps.find_entry.outputs.plugin_directory }}
+          SUT_PLUGIN_DIRECTORY: ${{ steps.find_entry.outputs.plugin_directory }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/ci/tests/phpstan/results"
+
+          run_phpstan_pass() {
+            local label="$1"
+            local woo_version="$2"
+            local output_file="$3"
+            local config_file="qit-phpstan-${label}.neon"
+
+            rm -rf "$GITHUB_WORKSPACE/ci/tmp/wordpress/wp-content/plugins/woocommerce"
+            unzip -q "$TEST_TYPE_CACHE_DIR/woocommerce/woocommerce-${woo_version}.zip" -d "$GITHUB_WORKSPACE/ci/tmp/wordpress/wp-content/plugins/"
+
+            php "$GITHUB_WORKSPACE/ci/tests/phpstan/generate-phpstan.php" "$SUT_PLUGIN_DIRECTORY"
+            mv "$GITHUB_WORKSPACE/ci/tests/phpstan/phpstan.neon" "$SUT_DIRECTORY/$config_file"
+
+            set +e
+            (
+              cd "$SUT_DIRECTORY"
+              php "$GITHUB_WORKSPACE/ci/tests/phpstan/vendor/bin/phpstan.phar" \
+                --configuration="$config_file" \
+                --memory-limit=6G \
+                --error-format=json \
+                > "$output_file"
+            )
+            local exit_code=$?
+            set -e
+
+            echo "${label}_phpstan_exit_code=${exit_code}" >> "$GITHUB_OUTPUT"
+            echo "PHPStan ${label} exit code: ${exit_code}"
+          }
+
+          run_phpstan_pass "baseline" "$BASELINE_WOOCOMMERCE_VERSION" "$GITHUB_WORKSPACE/ci/tests/phpstan/results/phpstan-baseline.json"
+          run_phpstan_pass "target" "$WOOCOMMERCE_VERSION" "$GITHUB_WORKSPACE/ci/tests/phpstan/results/phpstan-target.json"
+
+      - name: Diff PHPStan Results
+        id: diff-phpstan
+        if: steps.download-woocommerce.outcome == 'success' && steps.run-phpstan-passes.outcome == 'success'
+        working-directory: ci/cli
+        env:
+          EXTENSION_SPECS_JSON: ${{ toJSON( matrix.test_run.custom_payload.extension_specs ) }}
+          SUT_VERSION_HEADER: ${{ steps.sut-version.outputs.header }}
+          BASELINE_PHPSTAN_EXIT: ${{ steps.run-phpstan-passes.outputs.baseline_phpstan_exit_code }}
+          TARGET_PHPSTAN_EXIT: ${{ steps.run-phpstan-passes.outputs.target_phpstan_exit_code }}
+          PHPSTAN_LEVEL: ${{ matrix.test_run.custom_payload.phpstan_level }}
+        run: |
+          baseline_exit="${BASELINE_PHPSTAN_EXIT:-2}"
+          target_exit="${TARGET_PHPSTAN_EXIT:-2}"
+          resolved_sut_version="${SUT_VERSION_HEADER:-$SUT_VERSION}"
+          phpstan_version="$(php "$GITHUB_WORKSPACE/ci/tests/phpstan/vendor/bin/phpstan.phar" --version)"
+
+          set +e
+          php src/cli.php phpstan-regression-diff \
+            "$GITHUB_WORKSPACE/ci/tests/phpstan/results/phpstan-baseline.json" \
+            "$GITHUB_WORKSPACE/ci/tests/phpstan/results/phpstan-target.json" \
+            --baseline-version "$BASELINE_WOOCOMMERCE_VERSION" \
+            --target-version "$WOOCOMMERCE_VERSION" \
+            --sut-version "$resolved_sut_version" \
+            --baseline-exit-code "$baseline_exit" \
+            --target-exit-code "$target_exit" \
+            --requested-php-version "$PHP_VERSION" \
+            --actual-php-version "${{ steps.verify-runtime.outputs.actual_version }}" \
+            --php-extensions-json '${{ steps.verify-runtime.outputs.verified_extensions }}' \
+            --phpstan-version "$phpstan_version" \
+            --phpstan-level "${PHPSTAN_LEVEL:-0}" \
+            --extension-specs-json "$EXTENSION_SPECS_JSON" \
+            --strip-prefix "$GITHUB_WORKSPACE/ci/" \
+            --output "$GITHUB_WORKSPACE/ci/tests/phpstan/compat-regression.json" \
+            --fail-on-introduced
+          diff_exit=$?
+          set -e
+
+          if [ "$diff_exit" -eq 0 ]; then
+            echo "REGRESSION_RESULT=success" >> "$GITHUB_ENV"
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "REGRESSION_RESULT=failure" >> "$GITHUB_ENV"
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Debug Compatibility Regression JSON
+        if: always()
+        run: cat ci/tests/phpstan/compat-regression.json || true
+
+      - name: Ensure Compatibility Regression Result JSON Exists
+        if: always()
+        env:
+          SUT_VERSION_HEADER: ${{ steps.sut-version.outputs.header }}
+          QIT_FAILURE_OUTPUT: ${{ github.workspace }}/ci/tests/phpstan/download-failure.json
+          ACTUAL_PHP_VERSION: ${{ steps.verify-runtime.outputs.actual_version }}
+          VERIFIED_PHP_EXTENSIONS: ${{ steps.verify-runtime.outputs.verified_extensions }}
+        run: |
+          resolved_sut_version="${SUT_VERSION_HEADER:-$SUT_VERSION}"
+          phpstan_version=""
+          if [ -f "$GITHUB_WORKSPACE/ci/tests/phpstan/vendor/bin/phpstan.phar" ]; then
+            phpstan_version="$(php "$GITHUB_WORKSPACE/ci/tests/phpstan/vendor/bin/phpstan.phar" --version 2>/dev/null || true)"
+          fi
+          RESULT_PATH="$GITHUB_WORKSPACE/ci/tests/phpstan/compat-regression.json" \
+            RESOLVED_SUT_VERSION="$resolved_sut_version" \
+            PHPSTAN_VERSION="$phpstan_version" \
+            php -r 'require getenv("GITHUB_WORKSPACE") . "/ci/cli/src/CompatibilityRegressionUnavailableResult.php"; \CI_CLI\CompatibilityRegressionUnavailableResult::write_if_missing(getenv("RESULT_PATH"), getenv("QIT_FAILURE_OUTPUT") ?: "", ["baseline_woocommerce_version" => getenv("BASELINE_WOOCOMMERCE_VERSION") ?: "", "target_woocommerce_version" => getenv("WOOCOMMERCE_VERSION") ?: "", "sut_version" => getenv("RESOLVED_SUT_VERSION") ?: "", "runtime" => ["requested_php_version" => getenv("PHP_VERSION") ?: "", "actual_php_version" => getenv("ACTUAL_PHP_VERSION") ?: "", "php_extensions" => json_decode(getenv("VERIFIED_PHP_EXTENSIONS"), true) ?: [], "phpstan_version" => getenv("PHPSTAN_VERSION") ?: ""]]);'
+          if [ "$(jq -r '.state // "unavailable"' "$GITHUB_WORKSPACE/ci/tests/phpstan/compat-regression.json")" = "unavailable" ]; then
+            echo "REGRESSION_RESULT=failure" >> "$GITHUB_ENV"
+          fi
+
+      - name: Audit WooCommerce Internal Namespace Usage
+        if: always() && steps.verify-runtime.outputs.valid == '1'
+        working-directory: ci/cli
+        env:
+          SUT_DIRECTORY: ${{ github.workspace }}/ci/${{ matrix.test_run.sut_type }}s/${{ steps.find_entry.outputs.plugin_directory }}
+          SUT_PLUGIN_DIRECTORY: ${{ steps.find_entry.outputs.plugin_directory }}
+        run: |
+          if [ -z "$SUT_PLUGIN_DIRECTORY" ]; then
+            SUT_DIRECTORY="$GITHUB_WORKSPACE/.qit-missing-sut"
+          fi
+          php src/cli.php internal-usage-scan "$SUT_DIRECTORY" \
+            --php-version "$PHP_VERSION" \
+            --merge-into "$GITHUB_WORKSPACE/ci/tests/phpstan/compat-regression.json"
+
+      - name: Index WooCommerce Ecosystem Usage
+        if: always() && steps.verify-runtime.outputs.valid == '1'
+        continue-on-error: true
+        working-directory: ci/cli
+        env:
+          PLUGINS_JSON: ${{ toJSON( matrix.test_run.plugins ) }}
+          SUT_DIRECTORY: ${{ github.workspace }}/ci/${{ matrix.test_run.sut_type }}s/${{ steps.find_entry.outputs.plugin_directory }}
+          SUT_PLUGIN_DIRECTORY: ${{ steps.find_entry.outputs.plugin_directory }}
+          SUT_VERSION_HEADER: ${{ steps.sut-version.outputs.header }}
+        run: |
+          if [ -z "$SUT_PLUGIN_DIRECTORY" ]; then
+            SUT_DIRECTORY="$GITHUB_WORKSPACE/.qit-missing-sut"
+          fi
+          resolved_sut_version="${SUT_VERSION_HEADER:-$SUT_VERSION}"
+          artifact_ref_json="$(printf '%s' "$PLUGINS_JSON" | jq -c --arg slug "$SUT_SLUG" 'map(select(.slug == $slug))[0].artifact_ref // {}')"
+          php src/cli.php ecosystem-usage-scan "$SUT_DIRECTORY" \
+            --php-version "$PHP_VERSION" \
+            --consumer-slug "$SUT_SLUG" \
+            --consumer-woo-id "$SUT_WOO_ID" \
+            --consumer-version "$resolved_sut_version" \
+            --artifact-ref-json "$artifact_ref_json" \
+            --artifact-path "$GITHUB_WORKSPACE/ci/${{ matrix.test_run.sut_type }}s/$SUT_SLUG.zip" \
+            --merge-into "$GITHUB_WORKSPACE/ci/tests/phpstan/compat-regression.json"
+
+      - name: Workflow Cancelled
+        id: workflow-cancelled
+        if: cancelled()
+        run: echo "cancelled=1" >> "$GITHUB_OUTPUT"
+
+      - name: Send test result
+        if: always()
+        working-directory: ci/cli
+        run: TEST_RESULT="${REGRESSION_RESULT:-failure}" php src/cli.php notify -r
+        env:
+          TEST_RUN_ID: ${{ matrix.test_run.test_run_id }}
+          CI_SECRET: ${{ secrets.CI_SECRET }}
+          CI_STAGING_SECRET: ${{ secrets.CI_STAGING_SECRET }}
+          MANAGER_HOST: ${{ github.event.client_payload.shared_matrix_data.manager_host }}
+          RESULTS_ENDPOINT: ${{ github.event.client_payload.shared_matrix_data.results_endpoint }}
+          TEST_RESULT_JSON: tests/phpstan/compat-regression.json
+          WORKSPACE: ${{ github.workspace }}/ci
+          SUT_VERSION: ${{ steps.sut-version.outputs.header }}
+          CANCELLED: ${{ steps.workflow-cancelled.outputs.cancelled }}
+
+      - name: Fail workflow on regression result failure
+        if: always()
+        run: |
+          if [ "${REGRESSION_RESULT:-failure}" != "success" ]; then
+            exit 1
+          fi
