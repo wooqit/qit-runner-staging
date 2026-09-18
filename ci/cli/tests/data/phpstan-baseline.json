@@ -1,0 +1,20 @@
+{
+  "totals": {
+    "errors": 0,
+    "file_errors": 1
+  },
+  "files": {
+    "/tmp/qit/wp-content/plugins/woocommerce-gateway-stripe/includes/class-wc-stripe-legacy.php": {
+      "errors": 1,
+      "messages": [
+        {
+          "message": "Call to an undefined method WC_Stripe_Legacy::legacy_helper().",
+          "line": 12,
+          "ignorable": true,
+          "identifier": "method.notFound"
+        }
+      ]
+    }
+  },
+  "errors": []
+}

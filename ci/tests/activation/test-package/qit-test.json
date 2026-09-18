@@ -1,0 +1,32 @@
+{
+    "package": "woocommerce/activation",
+    "requires": {
+        "plugins": ["woocommerce"]
+    },
+    "test_type": "e2e",
+    "test": {
+        "phases": {
+            "globalSetup": [
+                "wp plugin activate woocommerce",
+                "wp option update woocommerce_onboarding_profile_completed yes",
+                "wp option update woocommerce_redirect_to_setup no",
+                "wp option update woocommerce_onboarding_profile '{\"completed\":true,\"skipped\":true}' --format=json",
+                "wp option update woocommerce_coming_soon no",
+                "wp option update woocommerce_store_pages_only no"
+            ],
+            "setup": [],
+            "run": [
+                "npx playwright test"
+            ],
+            "teardown": []
+        },
+        "results": {
+            "ctrf-json": "./results/ctrf.json",
+            "allure-dir": "./results/allure",
+            "blob-dir": "./results/blob"
+        }
+    },
+    "mu_plugins": [
+        "./bootstrap/mu-plugin.php"
+    ]
+}
