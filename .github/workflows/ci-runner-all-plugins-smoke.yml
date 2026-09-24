@@ -1,0 +1,49 @@
+name: CI Runner All-Plugins Artifact Smoke
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: all-plugins Git ref to download from
+        required: true
+        default: master
+      zip_path:
+        description: Private artifact path used by the smoke check
+        required: true
+        default: product-packages/woocommerce-gift-cards/woocommerce-gift-cards.zip
+
+jobs:
+  validate-all-plugins-access:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download a private all-plugins artifact
+        env:
+          TOKEN: ${{ secrets.QIT_COMPATIBILITY_GITHUB_TOKEN || secrets.TOKEN }}
+          REF: ${{ inputs.ref }}
+          ZIP_PATH: ${{ inputs.zip_path }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN:-}" ]; then
+            echo "all-plugins artifact access smoke failed: compatibility GitHub token is missing."
+            exit 1
+          fi
+
+          encoded_ref="$(jq -nr --arg value "$REF" '$value | @uri')"
+          status="$(curl --silent --show-error --location --output /tmp/all-plugins-smoke.zip --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github.v3.raw' \
+            --header "Authorization: Bearer ${TOKEN}" \
+            --header 'User-Agent: qit-runner' \
+            "https://api.github.com/repos/woocommerce/all-plugins/contents/${ZIP_PATH}?ref=${encoded_ref}")"
+          if [ "$status" != "200" ]; then
+            echo "all-plugins artifact access smoke failed (HTTP ${status})."
+            exit 1
+          fi
+          if [ ! -s /tmp/all-plugins-smoke.zip ]; then
+            echo "all-plugins artifact access smoke failed: downloaded artifact is empty."
+            exit 1
+          fi
+          if ! unzip -tq /tmp/all-plugins-smoke.zip > /dev/null; then
+            echo "all-plugins artifact access smoke failed: downloaded artifact is not a valid ZIP."
+            exit 1
+          fi
+
+          echo "all-plugins artifact access smoke passed."
