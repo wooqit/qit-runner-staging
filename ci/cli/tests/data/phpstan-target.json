@@ -1,0 +1,31 @@
+{
+  "totals": {
+    "errors": 0,
+    "file_errors": 2
+  },
+  "files": {
+    "/tmp/qit/wp-content/plugins/woocommerce-gateway-stripe/includes/class-wc-stripe-legacy.php": {
+      "errors": 1,
+      "messages": [
+        {
+          "message": "Call to an undefined method WC_Stripe_Legacy::legacy_helper().",
+          "line": 12,
+          "ignorable": true,
+          "identifier": "method.notFound"
+        }
+      ]
+    },
+    "/tmp/qit/wp-content/plugins/woocommerce-gateway-stripe/includes/class-wc-stripe-payment-gateway.php": {
+      "errors": 1,
+      "messages": [
+        {
+          "message": "Non-abstract class WC_Stripe_Payment_Gateway contains abstract method get_payment_method_configuration from interface Automattic\\WooCommerce\\Blocks\\Payments\\PaymentMethodTypeInterface.",
+          "line": 42,
+          "ignorable": true,
+          "identifier": "method.abstract"
+        }
+      ]
+    }
+  },
+  "errors": []
+}

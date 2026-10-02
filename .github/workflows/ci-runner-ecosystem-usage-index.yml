@@ -1,0 +1,179 @@
+name: CI Runner Ecosystem Usage Index
+on:
+  repository_dispatch:
+    types: [cd-test-ecosystem-usage-index]
+
+jobs:
+  ecosystem-usage-index:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        test_run: ${{ github.event.client_payload.test_runs }}
+    env:
+      SUT_SLUG: ${{ matrix.test_run.sut_slug }}
+      SUT_WOO_ID: ${{ matrix.test_run.sut_woo_id }}
+      SUT_VERSION: ${{ matrix.test_run.sut_version }}
+      PLUGINS_JSON: ${{ toJSON(matrix.test_run.plugins) }}
+      RESULT_PATH: ${{ github.workspace }}/ci/ecosystem-usage-index.json
+    name: ${{ matrix.test_run.sut_name }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup parser runtime
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+          ini-values: memory_limit=1G
+
+      - name: CI CLI cache
+        id: cache-ci-cli
+        uses: actions/cache@v4
+        with:
+          path: ci/cli/vendor
+          key: ${{ runner.os }}-ci-cli-${{ hashFiles('ci/cli/composer.lock') }}
+
+      - name: Install CI CLI
+        if: steps.cache-ci-cli.outputs.cache-hit != 'true'
+        working-directory: ci/cli
+        run: composer install --no-interaction --no-progress --no-suggest --prefer-dist --optimize-autoloader --no-dev
+
+      - name: Notify Manager that scan started
+        working-directory: ci/cli
+        env:
+          TEST_RUN_ID: ${{ matrix.test_run.test_run_id }}
+          CI_SECRET: ${{ secrets.CI_SECRET }}
+          CI_STAGING_SECRET: ${{ secrets.CI_STAGING_SECRET }}
+          MANAGER_HOST: ${{ github.event.client_payload.shared_matrix_data.manager_host }}
+          RESULTS_ENDPOINT: ${{ github.event.client_payload.shared_matrix_data.in_progress_endpoint }}
+          TEST_RUN_HASH: ${{ matrix.test_run.custom_payload.hash }}
+          WORKFLOW_ID: ${{ github.run_id }}
+          CANCELLED: false
+        run: php src/cli.php notify -s
+
+      - name: Create temporary package directories
+        run: mkdir -p ci/plugins ci/themes
+
+      - name: Download exact package
+        id: download
+        continue-on-error: true
+        working-directory: ci/cli
+        env:
+          TOKEN: ${{ secrets.QIT_COMPATIBILITY_GITHUB_TOKEN || secrets.TOKEN }}
+          ACCEPT_HEADER: ${{ secrets.ACCEPT_HEADER }}
+          WOO_DOWNLOAD_URL: ${{ secrets.WOO_DOWNLOAD_URL }}
+          SHA_URL: ${{ secrets.SHA_URL }}
+          CI_ENCRYPTION_KEY: ${{ secrets.CI_ENCRYPTION_KEY }}
+          SHA_POSTFIELDS: ${{ secrets.SHA_POSTFIELDS }}
+          PLUGINS_ZIPS: ${{ toJSON(github.event.client_payload.shared_matrix_data.plugin_zips) }}
+          THEME_DIRECTORY: ${{ github.workspace }}/ci/themes
+          PLUGIN_DIRECTORY: ${{ github.workspace }}/ci/plugins
+          SKIP_CACHE: true
+        run: php src/cli.php download-plugins
+
+      - name: Identify package entry point
+        if: steps.download.outcome == 'success'
+        id: find-entry
+        continue-on-error: true
+        working-directory: ci/bin
+        env:
+          PARENT_DIRECTORY: ${{ github.workspace }}/ci/${{ matrix.test_run.sut_type }}s
+          PLUGIN_TYPE: ${{ matrix.test_run.sut_type }}
+          PLUGIN_SLUG: ${{ matrix.test_run.sut_slug }}
+          GITHUB_OUTPUT: $GITHUB_OUTPUT
+        run: php find-plugin-entrypoint.php "$PARENT_DIRECTORY" "$PLUGIN_SLUG" "$PLUGIN_TYPE"
+
+      - name: Read package version
+        if: steps.find-entry.outcome == 'success'
+        id: package-version
+        continue-on-error: true
+        working-directory: ci/cli
+        env:
+          PLUGIN_DIRECTORY: ${{ github.workspace }}/ci/${{ matrix.test_run.sut_type }}s/${{ steps.find-entry.outputs.plugin_directory }}
+          PLUGIN_TYPE: ${{ matrix.test_run.sut_type }}
+          PLUGIN_SLUG: ${{ steps.find-entry.outputs.entry_point }}
+        run: echo "version=$(php src/cli.php header -o Version)" >> "$GITHUB_OUTPUT"
+
+      - name: Scan ecosystem usage
+        if: always()
+        continue-on-error: true
+        working-directory: ci/cli
+        env:
+          ENTRY_DIRECTORY: ${{ steps.find-entry.outputs.plugin_directory }}
+          DETECTED_VERSION: ${{ steps.package-version.outputs.version }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          ENTRY_OUTCOME: ${{ steps.find-entry.outcome }}
+          VERSION_OUTCOME: ${{ steps.package-version.outcome }}
+        run: |
+          write_failure() {
+            jq -n \
+              --arg stage "$1" \
+              --arg code "$2" \
+              --arg message "$3" \
+              '{failure: {stage: $stage, code: $code, message: $message}}' > "$RESULT_PATH"
+          }
+          if [ "$DOWNLOAD_OUTCOME" != "success" ]; then
+            write_failure "plugin_download" "download_failed" "Exact Marketplace package download failed."
+            exit 0
+          fi
+          if [ "$ENTRY_OUTCOME" != "success" ] || [ -z "$ENTRY_DIRECTORY" ]; then
+            write_failure "plugin_download" "package_entrypoint_missing" "Downloaded package entry point could not be identified."
+            exit 0
+          fi
+          if [ "$VERSION_OUTCOME" != "success" ]; then
+            write_failure "setup" "package_version_unreadable" "Downloaded package version could not be read."
+            exit 0
+          fi
+          if [ "$DETECTED_VERSION" != "$SUT_VERSION" ]; then
+            write_failure "setup" "artifact_version_mismatch" "Downloaded package version does not match the scheduled version."
+            exit 0
+          fi
+          source_directory="$GITHUB_WORKSPACE/ci/${{ matrix.test_run.sut_type }}s/${ENTRY_DIRECTORY}"
+          artifact_ref_json="$(printf '%s' "$PLUGINS_JSON" | jq -c --arg slug "$SUT_SLUG" 'map(select(.slug == $slug))[0].artifact_ref // {}')"
+          if ! php src/cli.php ecosystem-usage-scan "$source_directory" \
+            --consumer-slug "$SUT_SLUG" \
+            --consumer-woo-id "$SUT_WOO_ID" \
+            --consumer-version "$SUT_VERSION" \
+            --artifact-ref-json "$artifact_ref_json" \
+            --artifact-path "$GITHUB_WORKSPACE/ci/${{ matrix.test_run.sut_type }}s/$SUT_SLUG.zip" \
+            --output "$RESULT_PATH"; then
+            write_failure "analysis" "scanner_failed" "Ecosystem usage scanner failed before producing an observation."
+            exit 1
+          fi
+
+      - name: Ensure a private scan result exists
+        if: always()
+        working-directory: ci/cli
+        run: |
+          if [ ! -s "$RESULT_PATH" ]; then
+            jq -n \
+              --arg stage "analysis" \
+              --arg code "result_missing" \
+              --arg message "Index worker exited without producing a scan result." \
+              '{failure: {stage: $stage, code: $code, message: $message}}' > "$RESULT_PATH"
+          fi
+
+      - name: Workflow cancelled
+        id: workflow-cancelled
+        if: cancelled()
+        run: echo "cancelled=1" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Manager with private scan result
+        if: always()
+        working-directory: ci/cli
+        env:
+          TEST_RESULT: success
+          TEST_RUN_ID: ${{ matrix.test_run.test_run_id }}
+          CI_SECRET: ${{ secrets.CI_SECRET }}
+          CI_STAGING_SECRET: ${{ secrets.CI_STAGING_SECRET }}
+          MANAGER_HOST: ${{ github.event.client_payload.shared_matrix_data.manager_host }}
+          RESULTS_ENDPOINT: ${{ github.event.client_payload.shared_matrix_data.results_endpoint }}
+          TEST_RESULT_JSON: ecosystem-usage-index.json
+          WORKSPACE: ${{ github.workspace }}/ci
+          SUT_VERSION: ${{ matrix.test_run.sut_version }}
+          CANCELLED: ${{ steps.workflow-cancelled.outputs.cancelled }}
+        run: php src/cli.php notify -r

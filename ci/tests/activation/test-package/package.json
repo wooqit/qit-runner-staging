@@ -1,0 +1,15 @@
+{
+    "private": true,
+    "type": "module",
+    "devDependencies": {
+        "@playwright/test": "^1.54.2",
+        "allure-playwright": "^3.3.2",
+        "playwright-ctrf-json-reporter": "^0.0.22"
+    },
+    "dependencies": {
+        "@qit/helpers": "file:./qit-helpers"
+    },
+    "scripts": {
+        "test:e2e": "playwright test"
+    }
+}

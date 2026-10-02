@@ -1,0 +1,20 @@
+{
+  "totals": {
+    "errors": 0,
+    "file_errors": 1
+  },
+  "files": {
+    "/tmp/qit/wp-content/plugins/google-listings-and-ads/src/API/Google/AdsConversionAction.php": {
+      "errors": 1,
+      "messages": [
+        {
+          "message": "Method Automattic\\WooCommerce\\GoogleListingsAndAds\\API\\Google\\AdsConversionAction::get_conversion_action() should return array but return statement is missing.",
+          "line": 42,
+          "ignorable": false,
+          "identifier": "return.missing"
+        }
+      ]
+    }
+  },
+  "errors": []
+}
