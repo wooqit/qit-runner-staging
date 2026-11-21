@@ -1,0 +1,34 @@
+{
+  "package": "woocommerce/core-api-tests",
+  "test_type": "api",
+  "description": "WooCommerce Core REST API tests covering orders, products, coupons, customers, shipping, taxes, settings, webhooks, refunds, reports, payment gateways, and system status.",
+  "requires": {
+    "plugins": ["woocommerce"]
+  },
+  "test": {
+    "phases": {
+      "globalSetup": [
+        "wp plugin activate woocommerce",
+        "wp user create customer customer@woocommercecoree2etestsuite.com --user_pass=password --role=customer --first_name=Jane --last_name=Smith",
+        "wp option update woocommerce_onboarding_profile_completed yes",
+        "wp option update woocommerce_redirect_to_setup no",
+        "wp option update woocommerce_onboarding_profile '{\"completed\":true,\"skipped\":true}' --format=json",
+        "wp option update woocommerce_coming_soon no",
+        "wp option update woocommerce_store_pages_only no"
+      ],
+      "run": [
+        "npx playwright test --project=api"
+      ],
+      "teardown": []
+    },
+    "results": {
+      "ctrf-json": "./results/ctrf-report.json",
+      "allure-dir": "./results/allure"
+    }
+  },
+  "mu_plugins": [
+    "./bootstrap/basic-auth.php",
+    "./bootstrap/test-helper-apis.php",
+    "./bootstrap/disable-update-checks.php"
+  ]
+}

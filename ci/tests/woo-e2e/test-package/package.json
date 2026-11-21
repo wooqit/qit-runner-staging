@@ -1,0 +1,16 @@
+{
+    "devDependencies": {
+        "@faker-js/faker": "^10.6.0",
+        "@playwright/test": "^1.61.1",
+        "@woocommerce/e2e-utils-playwright": "file:./packages/js/e2e-utils-playwright",
+        "allure-commandline": "^2.32.2",
+        "allure-playwright": "^3.1.0",
+        "playwright-ctrf-json-reporter": "0.0.27"
+    },
+    "dependencies": {
+        "@babel/runtime": "^7.22.15",
+        "dotenv": "^16.3.1",
+        "lodash": "^4.17.21",
+        "regenerator-runtime": "^0.14.0"
+    }
+}

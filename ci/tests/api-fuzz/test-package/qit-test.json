@@ -1,0 +1,23 @@
+{
+  "$schema": "https://raw.githubusercontent.com/woocommerce/qit-cli/trunk/src/src/PreCommand/Schemas/test-package-manifest-schema.json",
+  "package": "woocommerce/api-fuzz-harness",
+  "test_type": "api",
+  "description": "Internal schema-driven WordPress REST API fuzzing harness.",
+  "requires": {
+    "plugins": ["woocommerce"]
+  },
+  "test": {
+    "phases": {
+      "globalSetup": [
+        "bash ./bin/setup-environment.sh"
+      ],
+      "setup": [],
+      "run": [],
+      "teardown": []
+    },
+    "results": {}
+  },
+  "mu_plugins": [
+    "./bootstrap/api-fuzz.php"
+  ]
+}
