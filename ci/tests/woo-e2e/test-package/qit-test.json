@@ -1,0 +1,45 @@
+{
+  "package": "woocommerce/core-e2e-tests",
+  "test_type": "e2e",
+  "description": "WooCommerce Core E2E critical flow tests covering shop, cart, checkout, my-account, orders, products, coupons, settings, and shipping.",
+  "requires": {
+    "plugins": ["woocommerce"]
+  },
+  "test": {
+    "phases": {
+      "globalSetup": [
+        "wp plugin activate woocommerce",
+        "wp theme install twentytwentythree --activate",
+        "wp rewrite structure '/%postname%/' --hard",
+        "wp user create customer customer@woocommercecoree2etestsuite.com --user_pass=password --role=customer --first_name=Jane --last_name=Smith",
+        "wp option update woocommerce_onboarding_profile_completed yes",
+        "wp option update woocommerce_redirect_to_setup no",
+        "wp option update woocommerce_onboarding_profile '{\"completed\":true,\"skipped\":true}' --format=json",
+        "wp option update woocommerce_coming_soon no",
+        "wp option update woocommerce_store_pages_only no",
+        "wp option update blogname 'WooCommerce Core E2E Test Suite'",
+        "wp option update woocommerce_enable_ajax_add_to_cart yes"
+      ],
+      "run": [
+        {
+          "command": "php ./bin/run-playwright.php",
+          "runs_on": "host",
+          "timeout": 3600
+        }
+      ],
+      "teardown": []
+    },
+    "results": {
+      "ctrf-json": "./test-results/ctrf-report.json",
+      "allure-dir": "./e2e/allure-results",
+      "blob-dir": "./test-results"
+    }
+  },
+  "mu_plugins": [
+    "./bootstrap/basic-auth.php",
+    "./bootstrap/e2e-test-helper.php",
+    "./bootstrap/disable-update-checks.php",
+    "./bootstrap/wp-cli-bridge.php",
+    "./bootstrap/seed-media.php"
+  ]
+}
